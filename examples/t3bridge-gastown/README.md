@@ -1,32 +1,43 @@
 # T3 Bridge Gas Town Example
 
-This example shows the Gas Town pack shape we use to exercise the `t3bridge`
-session provider against a T3Code fork.
+This example shows the smallest Gas City configuration needed to run an
+existing Gas Town pack through the native `t3bridge` session provider.
 
-The important pieces are:
+The example does not fork the Gas Town pack. It imports
+`../gastown/packs/gastown` so T3Code sees the same resolved agents, named
+sessions, patches, pool settings, and suspend/on-demand controls that GC would
+use normally.
 
-- `city.toml` sets `[session].provider = "t3bridge"`.
-- Agent templates still use normal GC provider selection, for example
-  `provider = "codex"`.
-- The pack defines rig-scoped Gas Town workers and their worktree layout.
-- T3 runtime data is discovered by the bridge from `T3_WS_URL`, `T3_HOME`, or
-  T3Code runtime state files.
+## Sidebar-Relevant Configuration
 
-## Test With A T3Code Fork
+T3Code's Gas City sidebar should be driven by the resolved `city.toml`, not by
+T3-specific pack copies.
 
-From the T3Code fork:
+- `[session].provider = "t3bridge"` makes GC create sessions through T3Code.
+- `[workspace].provider = "codex"` remains the default agent runtime provider.
+- `[imports.gastown]` exposes city-scoped pack agents and patches to the
+  workspace section of the sidebar.
+- `[[rigs]]` defines the rig row T3Code should display.
+- `[rigs.imports.gastown]` exposes rig-scoped agents, pools, and named sessions
+  under that rig.
+- Pack-defined `[[named_session]]`, `[[patches.agent]]`, pool bounds, suspend,
+  `always`, and `on_demand` state should flow through GC's resolved config API
+  unchanged.
+
+If a T3Code sidebar action changes an agent mode, suspension state, or rig
+binding, it should update the real runtime `city.toml` using the same GC config
+mutation path as the CLI/API.
+
+## Run It
+
+From a T3Code fork with the bridge support:
 
 ```sh
 cd /data/projects/t3code
-git checkout codex/sidebar-pool-followup
 bun dev
 ```
 
-This example was validated against `sfncore/t3code` branch
-`codex/sidebar-pool-followup`.
-
-If the T3Code server does not publish runtime state, export the WebSocket URL
-explicitly before starting GC:
+If the T3Code server does not publish runtime state, export the WebSocket URL:
 
 ```sh
 export T3_WS_URL=ws://127.0.0.1:3773/ws
@@ -40,8 +51,7 @@ tmp="$(mktemp -d)"
 cp -R examples/t3bridge-gastown "$tmp/city"
 ```
 
-Edit `$tmp/city/city.toml` and set the sample rig path to a local checkout you
-want agents to work in:
+Edit `$tmp/city/city.toml` and point the sample rig at a real checkout:
 
 ```toml
 [[rigs]]
@@ -60,8 +70,6 @@ gc session list --city "$tmp/city"
 Expected behavior:
 
 - GC creates sessions through T3Code, not tmux.
+- T3Code sidebar groups the workspace and rig from resolved `city.toml`.
+- Sidebar controls reflect the imported Gas Town pack's agents and modes.
 - T3Code threads receive GC metadata and startup envelope fields.
-- Pool workers such as `gascity/polecat` use the configured worktree path.
-- Legacy `session = "exec:...gc-session-t3"` configs still route to the native
-  bridge provider, but new configs should prefer `[session].provider =
-  "t3bridge"`.

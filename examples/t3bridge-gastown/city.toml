@@ -3,7 +3,6 @@
 [workspace]
 name = "t3bridge-gastown"
 provider = "codex"
-global_fragments = ["operational-awareness"]
 
 [session]
 provider = "t3bridge"
@@ -11,7 +10,7 @@ startup_timeout = "2m"
 nudge_ready_timeout = "30s"
 
 [imports.gastown]
-source = "packs/gastown"
+source = "../gastown/packs/gastown"
 
 [daemon]
 patrol_interval = "30s"
@@ -25,4 +24,4 @@ name = "example"
 path = "."
 
 [rigs.imports.gastown]
-source = "packs/gastown"
+source = "../gastown/packs/gastown"
