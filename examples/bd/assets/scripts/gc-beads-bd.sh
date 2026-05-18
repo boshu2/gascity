@@ -486,25 +486,59 @@ wait_for_bd_runtime_schema() {
     return 1
 }
 
-# ensure_types_custom_in_yaml writes types.custom to .beads/config.yaml when
-# the key is absent. bd reads this YAML key as a fallback when the database
-# config table is unset (see beads internal/config: GetCustomTypesFromYAML),
-# so writing here registers the types without paying bd's per-command
-# auto-migrate cost (~50s on populated databases). Idempotent: re-running
-# never appends duplicates.
+# ensure_types_custom_in_yaml writes types.custom to .beads/config.yaml.
+# bd reads this YAML key as a fallback when the database config table is
+# unset (see beads internal/config: GetCustomTypesFromYAML), so writing
+# here registers the types without paying bd's per-command auto-migrate
+# cost (~50s on populated databases).
+#
+# Idempotent against the desired effective set: re-running with the SAME
+# baseline is a no-op. The rewrite NEVER narrows the type set: if the YAML
+# already contains pack-defined or user-defined custom types beyond $types
+# (the GC baseline), those extensions are preserved. This matches the
+# merge semantics of internal/doctor/checks_custom_types.go:mergeCustomTypes
+# and fixes the gascity-side failure surfaced in #2154 — a stale or partial
+# line is replaced with the union of existing and required entries, never
+# overwritten with just the baseline.
 ensure_types_custom_in_yaml() {
     local dir="$1"
     local types="$2"
     local config_yaml="$dir/.beads/config.yaml"
     [ -f "$config_yaml" ] || return 0
     [ -n "$types" ] || return 0
-    if grep -q "^types\.custom:" "$config_yaml" 2>/dev/null; then
+
+    local current
+    current=$(sed -n 's/^types\.custom: *//p' "$config_yaml" 2>/dev/null | head -1)
+
+    local merged
+    merged=$(printf '%s,%s' "$current" "$types" | awk -F, '
+        {
+            for (i = 1; i <= NF; i++) {
+                t = $i
+                sub(/^[ \t]+/, "", t)
+                sub(/[ \t]+$/, "", t)
+                if (t == "") continue
+                if (!(t in seen)) {
+                    seen[t] = 1
+                    out = (out == "" ? t : out "," t)
+                }
+            }
+            print out
+        }
+    ')
+
+    # Short-circuit when the merged set already equals what's on disk:
+    # avoids mtime churn that downstream watchers might misread as a real
+    # change. Includes the case where current is already a superset of
+    # the baseline (operator/pack types appended to the GC list).
+    if [ "$current" = "$merged" ]; then
         return 0
     fi
+
     local tmp
     tmp=$(mktemp "$config_yaml.tmp.XXXXXX") || return 0
-    cat "$config_yaml" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
-    printf 'types.custom: %s\n' "$types" >> "$tmp"
+    sed '/^types\.custom:/d' "$config_yaml" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    printf 'types.custom: %s\n' "$merged" >> "$tmp"
     mv -f "$tmp" "$config_yaml" || rm -f "$tmp"
 }
 
