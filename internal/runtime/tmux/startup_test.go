@@ -63,6 +63,8 @@ type fakeStartOps struct {
 	disableMouseAndActivityErr error
 	runSetupCommandErr         error
 	sendKeysErr                error
+	capturePaneText            string
+	capturePaneErr             error
 }
 
 type errReader struct{}
@@ -171,6 +173,11 @@ func (f *fakeStartOps) disableMouseAndActivity(name string) error {
 	return f.disableMouseAndActivityErr
 }
 
+func (f *fakeStartOps) capturePane(name string, _ int) (string, error) {
+	f.calls = append(f.calls, startCall{method: "capturePane", name: name})
+	return f.capturePaneText, f.capturePaneErr
+}
+
 func (f *fakeStartOps) runSetupCommand(_ context.Context, cmd string, env map[string]string, timeout time.Duration) error {
 	f.calls = append(f.calls, startCall{
 		method:  "runSetupCommand",
@@ -221,6 +228,20 @@ func methodIndex(methods []string, method string) int {
 		}
 	}
 	return -1
+}
+
+func callsByMethod(t *testing.T, ops *fakeStartOps, method string, wantCount int) []startCall {
+	t.Helper()
+	var matches []startCall
+	for _, call := range ops.calls {
+		if call.method == method {
+			matches = append(matches, call)
+		}
+	}
+	if len(matches) != wantCount {
+		t.Fatalf("%s calls = %d, want %d; all calls = %v", method, len(matches), wantCount, ops.callMethods())
+	}
+	return matches
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +386,7 @@ func TestDoStartSession_FullSequence(t *testing.T) {
 		"waitForReady",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 
 	// Verify createSession got full config.
@@ -581,6 +603,163 @@ func TestDoStartSession_SessionDiesDuringStartup(t *testing.T) {
 	}
 }
 
+func TestDoStartSession_MissingFinalSessionDoesNotCapturePrefixSibling(t *testing.T) {
+	ops := &fakeStartOps{
+		hasSessionResult: false,
+		capturePaneText:  "prefix sibling output must not leak",
+	}
+
+	cfg := runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}
+
+	err := doStartSession(context.Background(), ops, "mayor", cfg, DefaultConfig().SetupTimeout)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, runtime.ErrSessionDiedDuringStartup) {
+		t.Fatalf("error = %v, want ErrSessionDiedDuringStartup", err)
+	}
+	if !strings.Contains(err.Error(), "session \"mayor\"") {
+		t.Fatalf("error = %v, want session name", err)
+	}
+	if strings.Contains(err.Error(), "prefix sibling output") || strings.Contains(err.Error(), "last pane output") {
+		t.Fatalf("error = %v, should not include pane output for missing exact session", err)
+	}
+	assertCallSequence(t, ops, []string{
+		"createSession",
+		"setRemainOnExit",
+		"disableMouseAndActivity",
+		"waitForCommand",
+		"acceptStartupDialogs",
+		"acceptStartupDialogs",
+		"hasSession",
+	})
+}
+
+func TestDoStartSession_ReadyDeadlineWithDeadPaneReportsProviderCrash(t *testing.T) {
+	running := false
+	ops := &fakeStartOps{
+		waitReadyErr:           context.DeadlineExceeded,
+		hasSessionResult:       true,
+		isSessionRunningResult: &running,
+		capturePaneText: "WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1)\n" +
+			"Error: Operation not permitted (os error 1)\n" +
+			"Pane is dead",
+	}
+
+	cfg := runtime.Config{
+		Command:           "codex",
+		ProcessNames:      []string{"codex"},
+		ReadyPromptPrefix: "› ",
+	}
+
+	err := doStartSession(context.Background(), ops, "mayor", cfg, DefaultConfig().SetupTimeout)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, runtime.ErrSessionDiedDuringStartup) {
+		t.Fatalf("error = %v, want ErrSessionDiedDuringStartup", err)
+	}
+	if strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("error = %v, should not surface generic deadline after pane died", err)
+	}
+	for _, want := range []string{"session \"mayor\"", "Operation not permitted", "Pane is dead"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want substring %q", err, want)
+		}
+	}
+	assertCallSequence(t, ops, []string{
+		"createSession",
+		"setRemainOnExit",
+		"disableMouseAndActivity",
+		"waitForCommand",
+		"acceptStartupDialogs",
+		"waitForReady",
+		"hasSession",
+		"isSessionRunning",
+		"capturePane",
+	})
+}
+
+func TestDoStartSession_FinalDeadPaneReportsProviderCrash(t *testing.T) {
+	running := false
+	ops := &fakeStartOps{
+		hasSessionResult:       true,
+		isSessionRunningResult: &running,
+		capturePaneText:        "panic: startup failed\nPane is dead",
+	}
+
+	cfg := runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}
+
+	err := doStartSession(context.Background(), ops, "mayor", cfg, DefaultConfig().SetupTimeout)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, runtime.ErrSessionDiedDuringStartup) {
+		t.Fatalf("error = %v, want ErrSessionDiedDuringStartup", err)
+	}
+	for _, want := range []string{"session \"mayor\"", "startup failed", "Pane is dead"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want substring %q", err, want)
+		}
+	}
+	assertCallSequence(t, ops, []string{
+		"createSession",
+		"setRemainOnExit",
+		"disableMouseAndActivity",
+		"waitForCommand",
+		"acceptStartupDialogs",
+		"acceptStartupDialogs",
+		"hasSession",
+		"isSessionRunning",
+		"capturePane",
+	})
+}
+
+func TestDoStartSession_FinalDeadPaneCaptureErrorFallsBack(t *testing.T) {
+	running := false
+	ops := &fakeStartOps{
+		hasSessionResult:       true,
+		isSessionRunningResult: &running,
+		capturePaneErr:         errors.New("capture failed"),
+	}
+
+	cfg := runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}
+
+	err := doStartSession(context.Background(), ops, "mayor", cfg, DefaultConfig().SetupTimeout)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, runtime.ErrSessionDiedDuringStartup) {
+		t.Fatalf("error = %v, want ErrSessionDiedDuringStartup", err)
+	}
+	if !strings.Contains(err.Error(), "session \"mayor\"") {
+		t.Fatalf("error = %v, want session name", err)
+	}
+	if strings.Contains(err.Error(), "last pane output") || strings.Contains(err.Error(), "capture failed") {
+		t.Fatalf("error = %v, want fallback without pane/capture detail", err)
+	}
+	assertCallSequence(t, ops, []string{
+		"createSession",
+		"setRemainOnExit",
+		"disableMouseAndActivity",
+		"waitForCommand",
+		"acceptStartupDialogs",
+		"acceptStartupDialogs",
+		"hasSession",
+		"isSessionRunning",
+		"capturePane",
+	})
+}
+
 func TestDoStartSession_HasSessionError(t *testing.T) {
 	ops := &fakeStartOps{
 		hasSessionErr: errors.New("tmux crashed"),
@@ -629,6 +808,7 @@ func TestDoStartSession_ProcessNamesOnly(t *testing.T) {
 		"acceptStartupDialogs",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 
 	// Verify isRuntimeRunning sees the process names in zombie detection path.
@@ -660,6 +840,7 @@ func TestDoStartSession_KimiSkipsStartupDialogAcceptance(t *testing.T) {
 		"waitForCommand",
 		"waitForReady",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -690,6 +871,7 @@ func TestDoStartSessionReturnsNudgeDeliveryError(t *testing.T) {
 		"setRemainOnExit",
 		"disableMouseAndActivity",
 		"hasSession",
+		"isSessionRunning",
 		"sendKeys",
 	})
 }
@@ -716,6 +898,7 @@ func TestDoStartSession_AcceptStartupDialogsOnly(t *testing.T) {
 		"acceptStartupDialogs",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -797,6 +980,7 @@ func TestDoStartSession_ReadyPromptPrefixOnly(t *testing.T) {
 		"disableMouseAndActivity",
 		"waitForReady",
 		"hasSession",
+		"isSessionRunning",
 	})
 
 	// Verify RuntimeConfig carries the prefix.
@@ -827,6 +1011,7 @@ func TestDoStartSession_ReadyDelayOnly(t *testing.T) {
 		"disableMouseAndActivity",
 		"waitForReady",
 		"hasSession",
+		"isSessionRunning",
 	})
 
 	// Verify RuntimeConfig carries the delay.
@@ -868,6 +1053,7 @@ func TestDoStartSession_TreatsDeadlineAfterReadyAsSuccessWhenSessionAlive(t *tes
 		"acceptStartupDialogs",
 		"waitForReady",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -908,6 +1094,7 @@ func TestDoStartSession_TreatsDeadlineAfterPostReadyAsSuccessWhenSessionAlive(t 
 		"waitForReady",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -935,6 +1122,7 @@ func TestDoStartSession_EmitsPermissionWarningOnly(t *testing.T) {
 		"acceptStartupDialogs",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -964,6 +1152,7 @@ func TestDoStartSession_ProcessNamesAndReadyPrefix(t *testing.T) {
 		"waitForReady",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -993,6 +1182,7 @@ func TestDoStartSession_CursorReadinessHintsTriggerRuntimeWait(t *testing.T) {
 		"waitForReady",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 
 	wfr := ops.calls[5]
@@ -1032,6 +1222,7 @@ func TestDoStartSession_ProcessNamesAndReadyDelayRechecksDialogs(t *testing.T) {
 		"waitForReady",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 	})
 }
 
@@ -1147,16 +1338,17 @@ func TestDoStartSession_SessionSetupRunsAfterAlive(t *testing.T) {
 		"acceptStartupDialogs",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 		"runSetupCommand",
 		"runSetupCommand",
 	})
 
-	// Verify both commands were recorded.
-	cmd1 := ops.calls[7]
+	setupCalls := callsByMethod(t, ops, "runSetupCommand", 2)
+	cmd1 := setupCalls[0]
 	if cmd1.command != "tmux set-option -t test status-style 'bg=blue'" {
 		t.Errorf("setup cmd[0] = %q, want status-style command", cmd1.command)
 	}
-	cmd2 := ops.calls[8]
+	cmd2 := setupCalls[1]
 	if cmd2.command != "tmux set-option -t test mouse on" {
 		t.Errorf("setup cmd[1] = %q, want mouse command", cmd2.command)
 	}
@@ -1194,22 +1386,26 @@ func TestDoStartSession_SessionSetupScriptRunsAfterCommands(t *testing.T) {
 		"acceptStartupDialogs",
 		"acceptStartupDialogs",
 		"hasSession",
+		"isSessionRunning",
 		"runSetupCommand",
 		"runSetupCommand",
 		"sendKeys",
 	})
 
+	setupCalls := callsByMethod(t, ops, "runSetupCommand", 2)
+	nudgeCalls := callsByMethod(t, ops, "sendKeys", 1)
+
 	// First runSetupCommand = inline command.
-	if ops.calls[7].command != "tmux set mouse on" {
-		t.Errorf("setup[0] = %q, want inline command", ops.calls[7].command)
+	if setupCalls[0].command != "tmux set mouse on" {
+		t.Errorf("setup[0] = %q, want inline command", setupCalls[0].command)
 	}
 	// Second runSetupCommand = script.
-	if ops.calls[8].command != "/city/scripts/setup.sh" {
-		t.Errorf("setup[1] = %q, want script", ops.calls[8].command)
+	if setupCalls[1].command != "/city/scripts/setup.sh" {
+		t.Errorf("setup[1] = %q, want script", setupCalls[1].command)
 	}
 	// sendKeys = nudge.
-	if ops.calls[9].command != "start working" {
-		t.Errorf("nudge = %q, want %q", ops.calls[9].command, "start working")
+	if nudgeCalls[0].command != "start working" {
+		t.Errorf("nudge = %q, want %q", nudgeCalls[0].command, "start working")
 	}
 }
 
@@ -1338,7 +1534,7 @@ func TestDoStartSession_PreStartRunsBeforeCreate(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	assertCallSequence(t, ops, []string{"runSetupCommand", "createSession", "setRemainOnExit", "disableMouseAndActivity", "hasSession"})
+	assertCallSequence(t, ops, []string{"runSetupCommand", "createSession", "setRemainOnExit", "disableMouseAndActivity", "hasSession", "isSessionRunning"})
 
 	pre := ops.calls[0]
 	if pre.command != "setup-worktree" {
