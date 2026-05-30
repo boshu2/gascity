@@ -141,6 +141,33 @@ func TestInboxUsesSingleBothTierMessageScanAcrossRoutes(t *testing.T) {
 	}
 }
 
+func TestInboxIncludesEphemeralMessages(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+	recipient := "agent-a"
+
+	ephemeral, err := store.Create(beads.Bead{
+		Title:       "status",
+		Type:        "message",
+		Status:      "open",
+		Assignee:    recipient,
+		From:        "human",
+		Description: "stored in wisps tier",
+		Ephemeral:   true,
+	})
+	if err != nil {
+		t.Fatalf("Create ephemeral message: %v", err)
+	}
+
+	msgs, err := p.Inbox(recipient)
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].ID != ephemeral.ID {
+		t.Fatalf("Inbox = %#v, want ephemeral message %s", msgs, ephemeral.ID)
+	}
+}
+
 func TestInboxRecipientsDedupesRoutesAndReadFiltering(t *testing.T) {
 	store := &messageListProbeStore{MemStore: beads.NewMemStore()}
 	p := New(store)
