@@ -105,6 +105,7 @@ agents/wolf/
 ```toml
 # agents/wolf/agent.toml
 scope = "rig"
+dir = "myproject"
 nudge = "Check your hook and mail, then act accordingly."
 work_dir = ".gc/worktrees/myproject/crew/wolf"
 idle_timeout = "4h"
