@@ -5,7 +5,7 @@ description: Recap what Gas Town gives you, see how Gas City works, then map Gas
 
 If you have run Gas Town, you already know its roles, its `~/gt/...` layout, and its `gt` commands. This page carries that knowledge across to Gas City.
 
-Gas City is the SDK that machinery was extracted into. Two things changed. First, the orchestrator hardcodes **zero roles** — every role you knew is now configuration, and you express Gas Town (or any orchestration) on top of a few primitives. Second, and bigger: the orchestrator can now run a formula as a **graph across many agents, out of your session** — decomposing a job into beads, fanning the ready ones out in parallel, gating each step on its dependencies, and retrying failures to completion. Your single-agent, in-session formulas still run (v1); this fleet orchestration (v2) is what's new. Because it is an SDK, a feature added to Gas City lifts *every* orchestrator built on it — Gas Town included.
+Gas City is the platform that machinery was extracted into. Two things changed. First, the orchestrator hardcodes **zero roles** — every role you knew is now configuration, and you express Gas Town (or any orchestration) on top of a few primitives. Second, and bigger: the orchestrator can now run a formula as a **graph across many agents, out of your session** — decomposing a job into beads, fanning the ready ones out in parallel, gating each step on its dependencies, and retrying failures to completion. Your single-agent, in-session formulas still run (v1); this fleet orchestration (v2) is what's new. Because it is a platform, a feature added to Gas City lifts *every* orchestrator built on it — Gas Town included.
 
 For the system-level mental model first, read [How Gas City Works](/getting-started/how-gas-city-works).
 
@@ -26,7 +26,7 @@ Six primitives carry the model:
 
 The backbone: packs declare agents, formulas, and orders → the local pack is the City → a Formula operates over a convoy of Beads, fanning to Agents that execute in a Rig → an Order automates *when* a formula runs → Events fire for observation. Run, sling, and order are derived under Formula; Health Patrol is one kind of order. A formula run materializes as beads at runtime (the v1 container is a *molecule*; ephemeral ones are *wisps*).
 
-The **orchestrator** is the engine that keeps these in sync. It owns SDK infrastructure operations — reconciliation, scaling, order evaluation, health patrol — so no SDK feature depends on a user-configured role existing.
+The **orchestrator** is the engine that keeps these in sync. It owns platform infrastructure operations — reconciliation, scaling, order evaluation, health patrol — so no platform feature depends on a user-configured role existing.
 
 The default mental model after the move:
 
@@ -38,7 +38,7 @@ The default mental model after the move:
 
 ## Mapping tables
 
-The five tables map Gas Town onto Gas City one domain at a time. Every entry on the right is **configuration** — a user-configured agent plus a prompt template — not a built-in SDK type.
+The five tables map Gas Town onto Gas City one domain at a time. Every entry on the right is **configuration** — a user-configured agent plus a prompt template — not a built-in platform type.
 
 ### Roles
 
@@ -142,11 +142,11 @@ edit local city.toml  →  include a pack that already solves most of it
 
 **Convoys stay bead-shaped.** Keep the convoy mental model for tracking work; the implementation boundary moved. Convoys are bead-backed grouping and lineage, `gc sling` creates convoy structure while routing, and formulas/orders/waits compose around that bead graph. The orchestration that runs over it is the orchestrator's control dispatcher — it executes the control beads (check, retry, fan-out, tally, drain) that drive a convoy's work to completion across many agents.
 
-**Crew and polecats are operating modes, not types.** *Crew* = persistent named agents; *polecats* = scalable or transient agents, often with worktrees. The SDK does not force the distinction — a pack can adopt, relax, or replace it.
+**Crew and polecats are operating modes, not types.** *Crew* = persistent named agents; *polecats* = scalable or transient agents, often with worktrees. The platform does not force the distinction — a pack can adopt, relax, or replace it.
 
 ## Where Gas City deliberately differs
 
-**The orchestrator owns infrastructure behavior.** It is the canonical owner of reconciling desired→running sessions, session scaling, order evaluation, health patrol, and garbage-collecting ephemeral run beads (the v1 *wisp* container). If something is fundamentally SDK infrastructure, put it on the orchestrator path rather than inventing another deacon-like role.
+**The orchestrator owns infrastructure behavior.** It is the canonical owner of reconciling desired→running sessions, session scaling, order evaluation, health patrol, and garbage-collecting ephemeral run beads (the v1 *wisp* container). If something is fundamentally platform infrastructure, put it on the orchestrator path rather than inventing another deacon-like role.
 
 **Filesystem layout is not the architecture.** Use `dir` (in `agent.toml`, or patched per-rig in `city.toml`) for scope and identity; `work_dir` only when the session must run elsewhere; bead metadata for durable handoff state.
 
@@ -156,14 +156,14 @@ edit local city.toml  →  include a pack that already solves most of it
 | provider scratch files would collide with another role | |
 | the role needs a durable sandbox independent from the rig root | |
 
-**Roles are examples, not SDK law.** The Gastown pack ships familiar roles as an example operating model, not a type system. Adding a behavior means editing a pack, formula, order, or prompt — not adding a hardcoded role. A **local city change** edits `city.toml` (rig overrides, patches, a city-specific agent); a **shared product change** edits the pack for a better default everywhere. Most onboarding work is local.
+**Roles are examples, not platform law.** The Gastown pack ships familiar roles as an example operating model, not a type system. Adding a behavior means editing a pack, formula, order, or prompt — not adding a hardcoded role. A **local city change** edits `city.toml` (rig overrides, patches, a city-specific agent); a **shared product change** edits the pack for a better default everywhere. Most onboarding work is local.
 
 ## Common translation patterns
 
 | Old Town instinct | Ask first | Default answer |
 |---|---|---|
 | "I need a new dog" | Can this be an exec order? | Prefer the order — trigger logic, history, orchestrator ownership, no agent slot. Reach for a scalable agent only if it needs a long-lived session, rich interactive context, or repeated agent judgment. |
-| "I need a witness-like lifecycle manager" | Which parts are orchestrator infra vs. bead transitions vs. formula logic vs. prompt guidance? | Only orchestrator infrastructure belongs in Go SDK code; the rest lives in the pack. |
+| "I need a witness-like lifecycle manager" | Which parts are orchestrator infra vs. bead transitions vs. formula logic vs. prompt guidance? | Only orchestrator infrastructure belongs in platform code; the rest lives in the pack. |
 | "I need another special directory tree" | Do I really? | Canonical repo root from the rig; isolated `work_dir` only for roles that mutate repos or need provider-file isolation; explicit env and metadata, never path inference. |
 | "I need to run something without an agent" | Could an exec order do it? | Use an exec order before inventing a plugin, helper role, or hidden session. |
 
@@ -181,7 +181,7 @@ These Town habits create unnecessary complexity in Gas City:
 
 - exact `~/gt/...` directory trees
 - path-derived identity
-- new hardcoded role names in SDK code
+- new hardcoded role names in platform code
 - plugin systems when an order is enough
 - special helper agents for work that is really a shell command
 - duplicating durable state outside beads when labels or metadata suffice

@@ -184,7 +184,7 @@ materializes it; once the mayor session is up, its state reads `awake` (or
 The `dolt.dog` pool is a background utility agent from the bundled `dolt` pack
 (pulled in through the `bd` include you saw in `city.toml` — the `dolt.`
 prefix is the import binding it arrived through). It handles Dolt database
-housekeeping for the beads backend. `control-dispatcher` is SDK
+housekeeping for the beads backend. `control-dispatcher` is platform
 infrastructure: the orchestrator uses it to advance formula workflows. You don't
 need to interact with either — ignore them for now.
 

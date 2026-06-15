@@ -12,7 +12,7 @@ drives the whole graph to completion *outside your session*.
 [Orders](/tutorials/07-orders) trigger formulas on a schedule or an event;
 health patrol keeps the fleet alive. **This orchestration is the point.**
 
-What makes it an *SDK* and not one fixed orchestrator: the orchestrator hardcodes
+What makes it a *platform* and not one fixed orchestrator: the orchestrator hardcodes
 **zero roles** — no built-in "manager" or "reviewer." Every role is
 configuration supplied through a **Pack**, and the whole orchestration is
 composed from six primitives, so the same engine becomes Gas Town, Ralph, or
@@ -36,7 +36,7 @@ primitives sit on.
 
 | Primitive | Role | Is | Key idea |
 | --- | --- | --- | --- |
-| **Agent** | WHO | a configured worker — name, provider, prompt template, scope | pure configuration, so define as many as you like; the SDK assumes none exists |
+| **Agent** | WHO | a configured worker — name, provider, prompt template, scope | pure configuration, so define as many as you like; the platform assumes none exists |
 | **Bead** | WHAT | one unit of work — ID, title, status, type | the universal substrate: tasks, mail, sessions, convoys are all beads differing only by `type` |
 | **Formula** | HOW | a reusable, written-down method applied over work | applying it *produces* work: a formula materializes as beads that outlive the file and any session |
 | **Rig** | WHERE | an external project (usually a git repo) registered with the city | each rig gets its own bead namespace and agent scope |
@@ -55,9 +55,9 @@ humans and agents can observe the whole thing.
 
 An **agent** is *who* does the work — a worker a pack defines as a prompt plus a
 scope and a provider. The prompt template is its entire behavioral spec; because
-the SDK has no hardcoded roles, a "reviewer" or a "planner" is nothing more than
-the prompt you wrote for it. When an agent is *running* it is a **session** — a
-live process the SDK can start, stop, prompt, and observe. The engine backing
+the platform has no hardcoded roles, a "reviewer" or a "planner" is nothing more
+than the prompt you wrote for it. When an agent is *running* it is a **session** —
+a live process the platform can start, stop, prompt, and observe. The engine backing
 that session is its **provider**. A single agent can be scaled into a **pool** of
 identical workers sharing one queue, sized to demand each tick. Sessions are
 disposable; the work they did survives them, because work lives in beads.

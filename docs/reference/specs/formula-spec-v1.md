@@ -309,7 +309,7 @@ instantiation:
 gc sling worker deploy --formula --var env=prod
 ```
 
-Here `worker` is a pack-supplied agent name, not an SDK built-in; targets in
+Here `worker` is a pack-supplied agent name, not a platform built-in; targets in
 these examples are illustrative names a pack declares.
 
 **Injected names.** v1 reserves no variable names; the v2

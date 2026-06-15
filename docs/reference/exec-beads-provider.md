@@ -31,7 +31,7 @@ at their own implementation.
 
 ### Store Interface (9 methods)
 
-`internal/beads/beads.go` defines the `Store` interface — the SDK's
+`internal/beads/beads.go` defines the `Store` interface — the platform's
 contract for the machinery that persists beads (the WHAT primitive):
 
 ```go
@@ -125,7 +125,7 @@ type Store interface {
 
 `Init`, `ConfigSet`, `Purge`, and `SetPurgeRunner` are lifecycle/admin
 operations, not bead CRUD. They belong to the provider implementation,
-not the SDK interface. The exec beads provider handles them as optional
+not the platform interface. The exec beads provider handles them as optional
 operations (exit 2 = unsupported).
 
 ### 3. Add Exec Beads Provider
@@ -219,7 +219,7 @@ no backing service (e.g., `br` which uses an embedded SQLite database)
 return exit 2 for all lifecycle operations.
 
 The `health` operation is a read-only probe — it MUST NOT attempt
-recovery or restarts. The SDK calls `recover` separately on health
+recovery or restarts. The platform calls `recover` separately on health
 failure. The `probe` operation is a lightweight availability check used
 during `gc init` to decide whether bead initialization can proceed now
 or must be deferred to `gc start`.
@@ -335,7 +335,7 @@ Stdout: the root bead ID as plain text (e.g., `WP-42\n`).
 
 ### Status Mapping
 
-Gas City's `beads.Store` surface uses the SDK's three-state vocabulary:
+Gas City's `beads.Store` surface uses the platform's three-state vocabulary:
 `open`, `in_progress`, and `closed`. Backends that expose a richer status
 set must map it onto those three values. The built-in `BdStore`, for
 example, maps bd's `blocked`, `review`, and `testing` states to `open`.
@@ -513,7 +513,7 @@ creates step beads with ParentID via `Create`, wires dependencies via
 distinct store operation: a formula run is materialized from bead CRUD plus
 formula parsing. Pushing formula knowledge into every backend script works
 against the principle that a primitive should become more useful as models
-improve — the SDK should handle composition, scripts handle storage.
+improve — the platform should handle composition, scripts handle storage.
 
 This means the Store interface becomes:
 
