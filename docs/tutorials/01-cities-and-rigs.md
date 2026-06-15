@@ -196,9 +196,9 @@ my-city  /Users/csells/my-city
   Suspended:  no
 
 Agents:
-  dolt.dog                scaled (min=0, max=2)
-    dolt.dog-1            stopped
-    dolt.dog-2            stopped
+  bd.dog                  scaled (min=0, max=2)
+    bd.dog-1              stopped
+    bd.dog-2              stopped
   control-dispatcher      stopped
 
 0/3 agents running
