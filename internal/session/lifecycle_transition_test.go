@@ -126,6 +126,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"state":                     string(StateActive),
 				"state_reason":              "creation_complete",
 				"creation_complete_at":      now.UTC().Format(time.RFC3339),
+				"awake_started_at":          now.UTC().Format(time.RFC3339),
 				"pending_create_claim":      "",
 				"pending_create_started_at": "",
 				"sleep_reason":              "",
@@ -474,6 +475,32 @@ func TestMetadataPatchApplyReturnsMergedCopy(t *testing.T) {
 	}
 	if original["state"] != string(StateAsleep) {
 		t.Fatalf("original state = %q, want original map unchanged", original["state"])
+	}
+}
+
+func TestCommitStartedPatchStampsFreshAwakeEpochOnlyForNewInterval(t *testing.T) {
+	t0 := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+
+	// A genuine start/wake opens a new awake interval and stamps a fresh epoch.
+	startA := CommitStartedPatch(CommitStartedPatchInput{ConfirmState: true, StartsAwakeInterval: true, Now: t0})
+	epochA := startA["awake_started_at"]
+	if epochA == "" {
+		t.Fatal("StartsAwakeInterval must stamp awake_started_at")
+	}
+
+	// A second start a few hundred ms later (e.g. a rapid drain/rewake on a
+	// reused session bead) must get a distinct epoch, or the second awake
+	// interval would be suppressed by the first interval's emit marker.
+	startB := CommitStartedPatch(CommitStartedPatchInput{ConfirmState: true, StartsAwakeInterval: true, Now: t0.Add(250 * time.Millisecond)})
+	if startB["awake_started_at"] == epochA {
+		t.Fatalf("sub-second re-start reused epoch %q; intervals would collide", epochA)
+	}
+
+	// A recovery re-confirmation of an already-running runtime must not reset
+	// the in-flight interval's epoch.
+	recovered := CommitStartedPatch(CommitStartedPatchInput{ConfirmState: true, StartsAwakeInterval: false, Now: t0.Add(time.Hour)})
+	if v, ok := recovered["awake_started_at"]; ok {
+		t.Fatalf("recovery re-confirm must not stamp awake_started_at, got %q", v)
 	}
 }
 

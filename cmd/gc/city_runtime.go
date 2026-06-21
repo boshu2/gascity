@@ -134,6 +134,19 @@ type CityRuntime struct {
 
 const runtimeDemandSnapshotMaxAge = 30 * time.Second
 
+// scaleCheckDemandMinInterval floors how often a patrol tick re-runs an agent
+// scale_check probe. scale_check demand cannot ride the event-backed
+// demand-snapshot cache because its result is captured neither by the session
+// fingerprint nor by the event stream, so demandSnapshotsEnabled reports false
+// whenever any agent configures a scale_check. Without a floor, a sub-second
+// patrol_interval re-runs the probe subprocess every tick — driving a full,
+// metadata-filtered List against the managed Dolt store per tick. Flooring the
+// patrol re-eval cadence collapses that storm. It is a no-op for the default
+// patrol_interval (30s) and only bites pathologically fast patrol cadences,
+// where it bounds scale_check-routed pool-work discovery latency to this floor
+// (see demandSnapshotPatrolMaxAge).
+const scaleCheckDemandMinInterval = 1 * time.Second
+
 type runtimeDemandSnapshot struct {
 	createdAt          time.Time
 	sessionFingerprint string
@@ -2082,6 +2095,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		recordPhase(TraceSiteSessionSnapshot, "bead_reconcile.load_session_snapshot", phaseStart, traceSessionSnapshotFields(sessionBeads))
 		result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	}
+	// Emit any due compute usage facts by reusing the open-session snapshot this
+	// tick already loaded, rather than issuing a second redundant store scan.
+	cr.emitDueComputeFacts(ctx, sessionBeads.Open())
 	rigStores := cr.rigBeadStores()
 	assignedWorkBeads := result.AssignedWorkBeads
 	assignedWorkStoreRefs := result.AssignedWorkStoreRefs
@@ -2183,97 +2199,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// work_query here can block assigned-work resumes behind unrelated probes.
 	workSet := make(map[string]bool)
 	traceWorkRequested := traceWorkRequestedByTemplate(result.ScaleCheckCounts, result.NamedSessionDemand, workSet, cr.cfg)
-	if trace != nil {
-		phaseStart = time.Now()
-		templateNames := make(map[string]struct{})
-		openCounts := make(map[string]int)
-		desiredCounts := make(map[string]int)
-		for _, bead := range open {
-			template := normalizedSessionTemplate(bead, cr.cfg)
-			if template == "" {
-				continue
-			}
-			templateNames[template] = struct{}{}
-			openCounts[template]++
-			trace.RecordSessionBaseline(template, bead.Metadata["session_name"], map[string]any{
-				"state":        bead.Metadata["state"],
-				"sleep_reason": bead.Metadata["sleep_reason"],
-			})
-		}
-		for _, tp := range desiredState {
-			if tp.TemplateName == "" {
-				continue
-			}
-			templateNames[tp.TemplateName] = struct{}{}
-			desiredCounts[tp.TemplateName]++
-		}
-		for template := range poolDesired {
-			templateNames[template] = struct{}{}
-		}
-		for template := range workSet {
-			templateNames[template] = struct{}{}
-		}
-		for template := range traceWorkRequested {
-			templateNames[template] = struct{}{}
-		}
-		for _, template := range traceSetStrings(templateNames) {
-			status := TraceEvaluationEligible
-			reason := TraceReasonRetained
-			if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
-				status = TraceEvaluationSkipped
-				reason = TraceReasonNoDemand
-			}
-			trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
-				"desired_count":  desiredCounts[template],
-				"open_count":     openCounts[template],
-				"pool_desired":   poolDesired[template],
-				"work_requested": traceWorkRequested[template],
-			})
-		}
-		trace.RecordCycleInputSnapshot(map[string]any{
-			"desired_session_count":               len(desiredState),
-			"open_session_count":                  len(open),
-			"scale_check_counts":                  result.ScaleCheckCounts,
-			"pool_desired":                        poolDesired,
-			"ready_wait_count":                    len(readyWaitSet),
-			"work_set_count":                      len(workSet),
-			"store_query_partial":                 result.StoreQueryPartial,
-			"scale_check_query_partial":           len(result.ScaleCheckPartialTemplates) > 0,
-			"scale_check_partial_templates":       sortedBoolMapKeys(result.ScaleCheckPartialTemplates),
-			"pool_scale_check_partial_templates":  sortedBoolMapKeys(result.PoolScaleCheckPartialTemplates),
-			"named_scale_check_partial_templates": sortedBoolMapKeys(result.NamedScaleCheckPartialTemplates),
-			"session_query_partial":               result.SessionQueryPartial,
-			"snapshot_query_partial":              result.snapshotQueryPartial(),
-		})
-		for _, agent := range cr.cfg.Agents {
-			template := agent.QualifiedName()
-			if !trace.detailEnabled(template) {
-				continue
-			}
-			trace.RecordTemplateConfigSnapshot(template, map[string]any{
-				"provider":            firstNonEmpty(agent.Provider, cr.cfg.Session.Provider),
-				"session":             agent.Session,
-				"work_dir":            agent.WorkDir,
-				"dir":                 agent.Dir,
-				"suspended":           agent.Suspended,
-				"start_command":       agent.StartCommand,
-				"lifecycle":           agent.Lifecycle,
-				"args":                append([]string(nil), agent.Args...),
-				"prompt_mode":         agent.PromptMode,
-				"prompt_flag":         agent.PromptFlag,
-				"depends_on":          append([]string(nil), agent.DependsOn...),
-				"min_active_sessions": agent.MinActiveSessions,
-				"max_active_sessions": agent.MaxActiveSessions,
-				"scale_check":         agent.ScaleCheck,
-				"work_query":          agent.WorkQuery,
-				"sling_query":         agent.SlingQuery,
-			})
-		}
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
-			"template_count": len(templateNames),
-			"open_count":     len(open),
-		})
-	}
+	cr.recordReconcileTraceInputs(trace, open, desiredState, poolDesired, workSet, traceWorkRequested, readyWaitSet, result, recordPhase)
 
 	phaseStart = time.Now()
 	awakeAssignedWorkBeads := filterAssignedWorkBeadsForSessionWake(cr.cfg, cr.cityPath, open, assignedWorkBeads, assignedWorkStoreRefs)
@@ -2306,22 +2232,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		"awake_assigned_work_bead_count": len(awakeAssignedWorkBeads),
 	})
 	cr.requestDeferredDrainFollowUpTick()
-	if trace != nil {
-		phaseStart = time.Now()
-		for _, bead := range open {
-			template := normalizedSessionTemplate(bead, cr.cfg)
-			if template == "" {
-				continue
-			}
-			trace.RecordSessionResult(template, bead.Metadata["session_name"], TraceOutcomeComplete, TraceCompletenessComplete, map[string]any{
-				"state":        bead.Metadata["state"],
-				"sleep_reason": bead.Metadata["sleep_reason"],
-			})
-		}
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
-			"open_count": len(open),
-		})
-	}
+	cr.recordReconcileTraceResults(trace, open, recordPhase)
 	phaseStart = time.Now()
 	dispatchSessionBeads, err := loadSessionBeadSnapshot(store)
 	if err != nil {
@@ -2338,6 +2249,141 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
 
 	// Idle recovery: detect pool sessions stuck at the prompt after
+}
+
+// recordReconcileTraceInputs records the per-template baseline, the cycle input
+// snapshot, and per-template config snapshots for one reconcile tick. It is a
+// no-op when trace is nil. It is split out of beadReconcileTick so that the hot
+// reconcile path is not dominated by trace bookkeeping.
+func (cr *CityRuntime) recordReconcileTraceInputs(
+	trace *sessionReconcilerTraceCycle,
+	open []beads.Bead,
+	desiredState map[string]TemplateParams,
+	poolDesired map[string]int,
+	workSet map[string]bool,
+	traceWorkRequested map[string]bool,
+	readyWaitSet map[string]bool,
+	result DesiredStateResult,
+	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
+) {
+	if trace == nil {
+		return
+	}
+	phaseStart := time.Now()
+	templateNames := make(map[string]struct{})
+	openCounts := make(map[string]int)
+	desiredCounts := make(map[string]int)
+	for _, bead := range open {
+		template := normalizedSessionTemplate(bead, cr.cfg)
+		if template == "" {
+			continue
+		}
+		templateNames[template] = struct{}{}
+		openCounts[template]++
+		trace.RecordSessionBaseline(template, bead.Metadata["session_name"], map[string]any{
+			"state":        bead.Metadata["state"],
+			"sleep_reason": bead.Metadata["sleep_reason"],
+		})
+	}
+	for _, tp := range desiredState {
+		if tp.TemplateName == "" {
+			continue
+		}
+		templateNames[tp.TemplateName] = struct{}{}
+		desiredCounts[tp.TemplateName]++
+	}
+	for template := range poolDesired {
+		templateNames[template] = struct{}{}
+	}
+	for template := range workSet {
+		templateNames[template] = struct{}{}
+	}
+	for template := range traceWorkRequested {
+		templateNames[template] = struct{}{}
+	}
+	for _, template := range traceSetStrings(templateNames) {
+		status := TraceEvaluationEligible
+		reason := TraceReasonRetained
+		if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
+			status = TraceEvaluationSkipped
+			reason = TraceReasonNoDemand
+		}
+		trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
+			"desired_count":  desiredCounts[template],
+			"open_count":     openCounts[template],
+			"pool_desired":   poolDesired[template],
+			"work_requested": traceWorkRequested[template],
+		})
+	}
+	trace.RecordCycleInputSnapshot(map[string]any{
+		"desired_session_count":               len(desiredState),
+		"open_session_count":                  len(open),
+		"scale_check_counts":                  result.ScaleCheckCounts,
+		"pool_desired":                        poolDesired,
+		"ready_wait_count":                    len(readyWaitSet),
+		"work_set_count":                      len(workSet),
+		"store_query_partial":                 result.StoreQueryPartial,
+		"scale_check_query_partial":           len(result.ScaleCheckPartialTemplates) > 0,
+		"scale_check_partial_templates":       sortedBoolMapKeys(result.ScaleCheckPartialTemplates),
+		"pool_scale_check_partial_templates":  sortedBoolMapKeys(result.PoolScaleCheckPartialTemplates),
+		"named_scale_check_partial_templates": sortedBoolMapKeys(result.NamedScaleCheckPartialTemplates),
+		"session_query_partial":               result.SessionQueryPartial,
+		"snapshot_query_partial":              result.snapshotQueryPartial(),
+	})
+	for _, agent := range cr.cfg.Agents {
+		template := agent.QualifiedName()
+		if !trace.detailEnabled(template) {
+			continue
+		}
+		trace.RecordTemplateConfigSnapshot(template, map[string]any{
+			"provider":            firstNonEmpty(agent.Provider, cr.cfg.Session.Provider),
+			"session":             agent.Session,
+			"work_dir":            agent.WorkDir,
+			"dir":                 agent.Dir,
+			"suspended":           agent.Suspended,
+			"start_command":       agent.StartCommand,
+			"lifecycle":           agent.Lifecycle,
+			"args":                append([]string(nil), agent.Args...),
+			"prompt_mode":         agent.PromptMode,
+			"prompt_flag":         agent.PromptFlag,
+			"depends_on":          append([]string(nil), agent.DependsOn...),
+			"min_active_sessions": agent.MinActiveSessions,
+			"max_active_sessions": agent.MaxActiveSessions,
+			"scale_check":         agent.ScaleCheck,
+			"work_query":          agent.WorkQuery,
+			"sling_query":         agent.SlingQuery,
+		})
+	}
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
+		"template_count": len(templateNames),
+		"open_count":     len(open),
+	})
+}
+
+// recordReconcileTraceResults records the per-session terminal result for one
+// reconcile tick. No-op when trace is nil.
+func (cr *CityRuntime) recordReconcileTraceResults(
+	trace *sessionReconcilerTraceCycle,
+	open []beads.Bead,
+	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
+) {
+	if trace == nil {
+		return
+	}
+	phaseStart := time.Now()
+	for _, bead := range open {
+		template := normalizedSessionTemplate(bead, cr.cfg)
+		if template == "" {
+			continue
+		}
+		trace.RecordSessionResult(template, bead.Metadata["session_name"], TraceOutcomeComplete, TraceCompletenessComplete, map[string]any{
+			"state":        bead.Metadata["state"],
+			"sleep_reason": bead.Metadata["sleep_reason"],
+		})
+	}
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
+		"open_count": len(open),
+	})
 }
 
 func filterReleasedAssignedWorkBeads(assignedWorkBeads []beads.Bead, released []releasedPoolAssignment) []beads.Bead {
@@ -2965,9 +3011,9 @@ func (cr *CityRuntime) shouldRefreshDemandSnapshot(
 	configChanged bool,
 	sessionFingerprint string,
 ) bool {
-	if !cr.demandSnapshotsEnabled() {
-		return true
-	}
+	// Non-patrol triggers (config reloads and controller pokes — e.g. from
+	// sling-dispatched work) always rebuild immediately; only patrol-cadence
+	// re-evaluation is throttled below.
 	if configChanged || trigger != "patrol" {
 		return true
 	}
@@ -2977,7 +3023,36 @@ func (cr *CityRuntime) shouldRefreshDemandSnapshot(
 	if cr.demandSnapshot.sessionFingerprint != sessionFingerprint {
 		return true
 	}
-	return time.Since(cr.demandSnapshot.createdAt) >= runtimeDemandSnapshotMaxAge
+	maxAge := cr.demandSnapshotPatrolMaxAge()
+	if maxAge <= 0 {
+		return true
+	}
+	return time.Since(cr.demandSnapshot.createdAt) >= maxAge
+}
+
+// demandSnapshotPatrolMaxAge reports how long a cached demand snapshot may be
+// reused across consecutive patrol ticks, or 0 when patrol must rebuild every
+// tick. Non-patrol triggers bypass this entirely (see shouldRefreshDemandSnapshot).
+func (cr *CityRuntime) demandSnapshotPatrolMaxAge() time.Duration {
+	if cr.demandSnapshotsEnabled() {
+		return runtimeDemandSnapshotMaxAge
+	}
+	// Snapshots are not event-backed. Without an event provider the cache
+	// cannot be invalidated by routed-work events, so patrol must rebuild every
+	// tick to stay responsive.
+	if cr.cs == nil || cr.cs.EventProvider() == nil {
+		return 0
+	}
+	// An event provider exists but a configured scale_check makes demand
+	// non-event-backed, so it cannot ride the 30s cache. The control-dispatcher
+	// does not poke the controller for scale_check-routed pool work (only sling
+	// does), so that work is discovered by the next patrol scale_check rather
+	// than by an immediate poke. Flooring the patrol re-eval cadence therefore
+	// bounds discovery latency to scaleCheckDemandMinInterval and is a no-op
+	// whenever patrol_interval >= that floor (e.g. the 30s default); it only
+	// bites sub-second patrol_intervals, where it stops the probe subprocess
+	// from running on every tick.
+	return scaleCheckDemandMinInterval
 }
 
 func (cr *CityRuntime) demandSnapshotsEnabled() bool {

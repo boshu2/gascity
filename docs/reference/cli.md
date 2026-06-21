@@ -34,6 +34,7 @@ gc [flags]
 | [gc config](#gc-config) | Inspect and validate city configuration |
 | [gc converge](#gc-converge) | Manage convergence loops (bounded iterative refinement) |
 | [gc convoy](#gc-convoy) | Manage convoys — graphs of related work |
+| [gc costs](#gc-costs) | Show per-run usage and estimated cost for this city |
 | [gc dashboard](#gc-dashboard) | Web dashboard for monitoring the supervisor and managed cities |
 | [gc doctor](#gc-doctor) | Check workspace health |
 | [gc dolt-cleanup](#gc-dolt-cleanup) | Find and remove orphaned Dolt databases (Go-side core) |
@@ -1095,6 +1096,30 @@ gc convoy target <convoy-id> <branch> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
+
+## gc costs
+
+Aggregate recorded usage facts (model tokens and compute wall-seconds)
+by run for local cost insight.
+
+Reads .gc/usage.jsonl (the local usage sink) and groups facts by run id. This
+reflects facts only under the default "local" usage provider; with an "exec:"
+or "discard" provider the facts are forwarded out of process or dropped, so
+gc costs shows nothing local.
+
+Cost is a list-price estimate for decision support, not an authoritative
+charge; invocations with no pricing are flagged "unpriced" and excluded from
+the cost total.
+
+```
+gc costs
+```
+
+**Example:**
+
+```
+gc costs
+```
 
 ## gc dashboard
 
