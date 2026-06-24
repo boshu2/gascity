@@ -5627,6 +5627,91 @@ func TestBuildDesiredState_OnDemandNamedSession_DirectAssigneeMaterializes(t *te
 	}
 }
 
+// TestBuildDesiredState_NamedBackingPoolNoCap_RoutedDemandDoesNotSpawnPhantoms
+// is the ga-xq1fsv regression repro (molecule-patrol demand ratchet, healthy
+// reads). A [[named_session]] backed by a pool-capable agent template that has
+// NO custom scale_check and NO max_active_sessions cap must resolve unassigned
+// gc.routed_to=<template> patrol demand to its single canonical named identity
+// — never to generic "{name}-N" pool phantoms.
+//
+// Root cause (bda368b0e "keep template-routed graph work unassigned"): the
+// backsNamedSession branch in buildDesiredStateWithSessionBeads now appends the
+// template's default probe to defaultScaleTargets (build_desired_state.go:561),
+// so the unassigned routed patrol roots are counted as generic pool demand by
+// defaultScaleCheckCounts. ComputePoolDesiredStates then emits N "new" requests,
+// and because the template has no max=1 cap (UsesCanonicalSingletonPoolIdentity
+// is false) realizePoolDesiredSessions materializes them as witness-1..N
+// alongside the canonical "witness" named session. Before bda368b0e the same
+// probe fed only defaultNamedScaleTargets, so routed demand resolved to the
+// single named identity.
+//
+// This facet engages on fully healthy (non-partial) reads, so the ga-01yukx /
+// #3686 partial-read fail-closed guards never trigger. MemStore reads are
+// non-partial, asserted below. MUST fail on e22049f86 (1 named + N phantoms)
+// and pass after the fix.
+func TestBuildDesiredState_NamedBackingPoolNoCap_RoutedDemandDoesNotSpawnPhantoms(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	const template = "witness"
+	const routedDemand = 3
+	for i := 0; i < routedDemand; i++ {
+		if _, err := store.Create(beads.Bead{
+			Title:  "witness patrol root",
+			Type:   "task", // actionable root (wisp/task); molecule/step roots are Ready()-excluded
+			Status: "open",
+			Metadata: map[string]string{
+				"gc.routed_to": template,
+			},
+		}); err != nil {
+			t.Fatalf("create routed patrol demand %d: %v", i, err)
+		}
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         template,
+			StartCommand: "true",
+			WorkQuery:    "printf ''",
+			// no ScaleCheck        -> default routed-work probe drives demand
+			// no MaxActiveSessions -> UsesCanonicalSingletonPoolIdentity()==false,
+			//                         so pool path synthesizes {name}-N identities
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: template,
+			Mode:     "always",
+		}},
+	}
+	identity := cfg.NamedSessions[0].QualifiedName()
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+
+	// This facet must engage on healthy reads, distinguishing it from the
+	// ga-01yukx partial-read facet whose guards fail closed.
+	if len(dsResult.ScaleCheckPartialTemplates) != 0 ||
+		len(dsResult.PoolScaleCheckPartialTemplates) != 0 ||
+		len(dsResult.NamedScaleCheckPartialTemplates) != 0 {
+		t.Fatalf("repro must exercise healthy (non-partial) reads, but reads were partial: scale=%v pool=%v named=%v",
+			dsResult.ScaleCheckPartialTemplates, dsResult.PoolScaleCheckPartialTemplates, dsResult.NamedScaleCheckPartialTemplates)
+	}
+
+	var named, phantom []string
+	for key, tp := range dsResult.State {
+		if tp.ConfiguredNamedIdentity == identity {
+			named = append(named, key)
+			continue
+		}
+		phantom = append(phantom, key)
+	}
+	if len(named) != 1 {
+		t.Fatalf("expected exactly 1 canonical named session %q, got %d: %v (state=%+v)", identity, len(named), named, dsResult.State)
+	}
+	if len(phantom) != 0 {
+		t.Fatalf("named-backing pool template %q spawned %d phantom pool session(s) %v alongside the canonical named session; "+
+			"unassigned gc.routed_to patrol demand must resolve to the single named identity (<=1), not generic {name}-N pool workers "+
+			"(scale_check_counts=%v)", template, len(phantom), phantom, dsResult.ScaleCheckCounts)
+	}
+}
+
 func TestBuildDesiredState_OnDemandNamedSession_RuntimeAssigneeDoesNotMaterialize(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "fixture")
@@ -10532,6 +10617,47 @@ func TestBuildDesiredState_ScaleCheckPartialPoolBlocksNewCreates(t *testing.T) {
 		}
 	})
 
+	// Criterion #3 (ga-4qbgqf.1): awake sessions are also retained, not just active.
+	t.Run("one awake bead retained, no new creates", func(t *testing.T) {
+		store := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
+		awakeSession := makeSessionBead("session-worker-awake", "worker-awake-1", "awake", "1")
+
+		var stderr strings.Builder
+		result := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, time.Now().UTC(),
+			cfg, runtime.NewFake(), store, nil,
+			newSessionBeadSnapshot([]beads.Bead{awakeSession}),
+			nil, &stderr,
+		)
+
+		if !result.PoolScaleCheckPartialTemplates["worker"] {
+			t.Fatalf("PoolScaleCheckPartialTemplates[worker] = false, want true; stderr=%s", stderr.String())
+		}
+		if _, ok := result.State["worker-awake-1"]; !ok {
+			t.Fatalf("awake session not retained in desired state: keys=%v stderr=%s", mapKeys(result.State), stderr.String())
+		}
+		workerEntries := 0
+		for _, tp := range result.State {
+			if tp.TemplateName == "worker" {
+				workerEntries++
+			}
+		}
+		if workerEntries != 1 {
+			t.Fatalf("desired state has %d worker entries, want exactly 1; keys=%v", workerEntries, mapKeys(result.State))
+		}
+
+		snapshot := newSessionBeadSnapshot([]beads.Bead{awakeSession})
+		poolDesired := retainScaleCheckPartialPoolDesired(
+			cfg,
+			PoolDesiredCounts(ComputePoolDesiredStates(cfg, nil, snapshot.Open(), result.ScaleCheckCounts)),
+			snapshot,
+			result.PoolScaleCheckPartialTemplates,
+		)
+		if got := poolDesired["worker"]; got != 1 {
+			t.Fatalf("poolDesired[worker] = %d, want 1 (confirmed-alive awake bead)", got)
+		}
+	})
+
 	t.Run("zero existing beads yields zero creates", func(t *testing.T) {
 		store := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
 
@@ -10602,15 +10728,17 @@ func TestBuildDesiredState_ScaleCheckPartialPoolBlocksNewCreates(t *testing.T) {
 		}
 	})
 
-	// Criterion #5 (ga-4qbgqf.1): stale creating beads are shielded from drain
-	// during a partial tick by scaleCheckPartial, but roll back within one
-	// reconciler tick once the partial resolves.
-	t.Run("stale creating bead rolls back on next non-partial tick", func(t *testing.T) {
+	// Criterion #5 (ga-4qbgqf.1): the narrow alive-on-partial guard for pool creates
+	// allows stale creating beads to roll back within the partial tick itself.
+	// Only in-flight creates holding an active pending_create_claim lease are
+	// shielded; expired/cleared creates (no lease) drain immediately.
+	t.Run("stale creating bead rolls back during partial tick", func(t *testing.T) {
 		partialStore := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
 		staleSession := makeSessionBead("session-worker-stale", "worker-stale-4", "creating", "4")
 		snapshot := newSessionBeadSnapshot([]beads.Bead{staleSession})
 
-		// Partial tick: scaleCheckPartial shields the pool-managed creating bead from drain.
+		// Partial tick: the narrow pool-create guard (poolPartialCreate) does NOT
+		// shield a stale creating bead (no pending_create_claim), so it rolls back now.
 		var pStderr strings.Builder
 		partialResult := buildDesiredStateWithSessionBeads(
 			"test-city", cityPath, time.Now().UTC(),
@@ -10620,20 +10748,226 @@ func TestBuildDesiredState_ScaleCheckPartialPoolBlocksNewCreates(t *testing.T) {
 		if !partialResult.PoolScaleCheckPartialTemplates["worker"] {
 			t.Fatalf("partial tick: PoolScaleCheckPartialTemplates[worker] = false; stderr=%s", pStderr.String())
 		}
-		if _, ok := partialResult.State["worker-stale-4"]; !ok {
-			t.Fatalf("partial tick: stale creating bead absent from State (scaleCheckPartialSessionPreservable must retain it); keys=%v stderr=%s", mapKeys(partialResult.State), pStderr.String())
+		if _, ok := partialResult.State["worker-stale-4"]; ok {
+			t.Fatalf("partial tick: stale creating bead unexpectedly retained in State; narrow guard must allow rollback; keys=%v stderr=%s", mapKeys(partialResult.State), pStderr.String())
 		}
+	})
 
-		// Normal tick: partial resolves; scaleCheckPartial is false.
-		// The pool bead is not desired (poolDesired=0 with no demand), so
-		// the controllerManagedPool guard at build_desired_state.go:1903 drains it.
-		normalResult := buildDesiredStateWithSessionBeads(
+	// Criterion #6 (ga-4qbgqf.3): fresh in-flight creates (pending_create_claim=true)
+	// are retained in desired state and in the retained count during a partial tick.
+	// poolPartialAlive is true via isPendingPoolCreate, so the narrow guard keeps them.
+	t.Run("fresh pending_create_claim creating bead retained during partial tick", func(t *testing.T) {
+		partialStore := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
+		freshCreate := beads.Bead{
+			ID:     "session-worker-fresh",
+			Title:  "worker",
+			Type:   sessionBeadType,
+			Status: "open",
+			Labels: []string{sessionBeadLabel, "template:worker"},
+			Metadata: map[string]string{
+				"session_name":         "worker-fresh-3",
+				"template":             "worker",
+				"agent_name":           "worker",
+				"pool_slot":            "3",
+				poolManagedMetadataKey: boolMetadata(true),
+				"state":                "creating",
+				"pending_create_claim": boolMetadata(true),
+			},
+		}
+		snapshot := newSessionBeadSnapshot([]beads.Bead{freshCreate})
+
+		var pStderr strings.Builder
+		partialResult := buildDesiredStateWithSessionBeads(
 			"test-city", cityPath, time.Now().UTC(),
-			cfg, runtime.NewFake(), beads.NewMemStore(), nil,
-			snapshot, nil, io.Discard,
+			cfg, runtime.NewFake(), partialStore, nil,
+			snapshot, nil, &pStderr,
 		)
-		if _, ok := normalResult.State["worker-stale-4"]; ok {
-			t.Fatalf("normal tick: stale creating bead still in State after partial resolved; keys=%v", mapKeys(normalResult.State))
+		if !partialResult.PoolScaleCheckPartialTemplates["worker"] {
+			t.Fatalf("partial tick: PoolScaleCheckPartialTemplates[worker] = false; stderr=%s", pStderr.String())
+		}
+		if _, ok := partialResult.State["worker-fresh-3"]; !ok {
+			t.Fatalf("partial tick: fresh pending_create_claim=true bead absent from State; poolPartialAlive must retain it; keys=%v stderr=%s", mapKeys(partialResult.State), pStderr.String())
+		}
+		poolDesired := retainScaleCheckPartialPoolDesired(
+			cfg,
+			PoolDesiredCounts(ComputePoolDesiredStates(cfg, nil, snapshot.Open(), partialResult.ScaleCheckCounts)),
+			snapshot,
+			partialResult.PoolScaleCheckPartialTemplates,
+		)
+		if got := poolDesired["worker"]; got != 1 {
+			t.Fatalf("poolDesired[worker] = %d, want 1 (fresh pending_create_claim=true create counts as retained capacity)", got)
+		}
+	})
+
+	// Change 3 (ga-btv7tm): draining/drained/archived sessions must NOT be
+	// preserved in desired state during a partial tick. Preserving them would
+	// interrupt an in-progress drain lifecycle.
+	t.Run("draining/drained/archived NOT preserved during partial tick", func(t *testing.T) {
+		for _, state := range []string{"draining", "drained", "archived"} {
+			state := state
+			t.Run(state, func(t *testing.T) {
+				store := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
+				b := makeSessionBead("session-worker-"+state, "worker-"+state+"-1", state, "1")
+				var pStderr strings.Builder
+				result := buildDesiredStateWithSessionBeads(
+					"test-city", cityPath, time.Now().UTC(),
+					cfg, runtime.NewFake(), store, nil,
+					newSessionBeadSnapshot([]beads.Bead{b}),
+					nil, &pStderr,
+				)
+				if _, ok := result.State["worker-"+state+"-1"]; ok {
+					t.Fatalf("state=%s bead must NOT be preserved in desired during partial tick (would interrupt drain); keys=%v stderr=%s",
+						state, mapKeys(result.State), pStderr.String())
+				}
+			})
+		}
+	})
+}
+
+func TestBuildDesiredState_ProviderRedBlocksNewPoolSessionCreate(t *testing.T) {
+	writeHealthFile := func(t *testing.T, cityPath, status string) {
+		t.Helper()
+		dir := filepath.Join(cityPath, ".gc", "cache")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		probedAt := float64(time.Now().UnixNano()) / 1e9
+		content := fmt.Sprintf(`{"providers":[{"provider":"claude","status":%q,"probed_at":%f}]}`, status, probedAt)
+		if err := os.WriteFile(filepath.Join(dir, "provider-health.json"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	makeCfg := func() *config.City {
+		return &config.City{
+			Workspace: config.Workspace{Name: "test-city"},
+			Agents: []config.Agent{{
+				Name:              "worker",
+				Provider:          "claude",
+				StartCommand:      "echo",
+				ScaleCheck:        "printf 3",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(5),
+			}},
+		}
+	}
+
+	makeSessionBead := func(id, sessionName, state, slot string) beads.Bead {
+		return beads.Bead{
+			ID:     id,
+			Title:  "worker",
+			Type:   sessionBeadType,
+			Status: "open",
+			Labels: []string{sessionBeadLabel, "template:worker"},
+			Metadata: map[string]string{
+				"session_name":         sessionName,
+				"template":             "worker",
+				"agent_name":           "worker",
+				"pool_slot":            slot,
+				poolManagedMetadataKey: boolMetadata(true),
+				"state":                state,
+			},
+		}
+	}
+
+	// Scenario A: registry red — no new creates for pool agent.
+	t.Run("registry red blocks new creates", func(t *testing.T) {
+		cityPath := t.TempDir()
+		writeHealthFile(t, cityPath, "unhealthy")
+		cfg := makeCfg()
+		store := beads.NewMemStore()
+		var stderr strings.Builder
+		result := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, time.Now().UTC(),
+			cfg, runtime.NewFake(), store, nil,
+			newSessionBeadSnapshot(nil),
+			nil, &stderr,
+		)
+		for _, tp := range result.State {
+			if tp.TemplateName == "worker" {
+				t.Fatalf("expected no worker creates when provider is red; got entry %q; stderr=%s", tp.SessionName, stderr.String())
+			}
+		}
+		if !strings.Contains(stderr.String(), "provider red, fresh create blocked") {
+			t.Fatalf("expected 'provider red, fresh create blocked' in stderr; stderr=%s", stderr.String())
+		}
+	})
+
+	// Scenario B: registry absent — fail-open, creates proceed normally.
+	t.Run("registry absent fails open", func(t *testing.T) {
+		cityPath := t.TempDir()
+		// no provider-health.json written
+		cfg := makeCfg()
+		store := beads.NewMemStore()
+		var stderr strings.Builder
+		result := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, time.Now().UTC(),
+			cfg, runtime.NewFake(), store, nil,
+			newSessionBeadSnapshot(nil),
+			nil, &stderr,
+		)
+		workerCreates := 0
+		for _, tp := range result.State {
+			if tp.TemplateName == "worker" {
+				workerCreates++
+			}
+		}
+		if workerCreates == 0 {
+			t.Fatalf("expected worker creates when registry absent (fail-open); stderr=%s", stderr.String())
+		}
+	})
+
+	// Scenario C: registry healthy — creates proceed normally.
+	t.Run("registry healthy allows create", func(t *testing.T) {
+		cityPath := t.TempDir()
+		writeHealthFile(t, cityPath, "healthy")
+		cfg := makeCfg()
+		store := beads.NewMemStore()
+		var stderr strings.Builder
+		result := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, time.Now().UTC(),
+			cfg, runtime.NewFake(), store, nil,
+			newSessionBeadSnapshot(nil),
+			nil, &stderr,
+		)
+		workerCreates := 0
+		for _, tp := range result.State {
+			if tp.TemplateName == "worker" {
+				workerCreates++
+			}
+		}
+		if workerCreates == 0 {
+			t.Fatalf("expected worker creates when provider is healthy; stderr=%s", stderr.String())
+		}
+	})
+
+	// Scenario D: red gate does not block reuse of an existing active session;
+	// no additional new creates are planned.
+	t.Run("red gate does not block reuse of active session", func(t *testing.T) {
+		cityPath := t.TempDir()
+		writeHealthFile(t, cityPath, "unhealthy")
+		cfg := makeCfg()
+		active := makeSessionBead("session-worker-1", "worker-1", "active", "1")
+		store := beads.NewMemStore()
+		var stderr strings.Builder
+		result := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, time.Now().UTC(),
+			cfg, runtime.NewFake(), store, nil,
+			newSessionBeadSnapshot([]beads.Bead{active}),
+			nil, &stderr,
+		)
+		if _, ok := result.State["worker-1"]; !ok {
+			t.Fatalf("active session must be reused even when provider is red; keys=%v stderr=%s", mapKeys(result.State), stderr.String())
+		}
+		workerEntries := 0
+		for _, tp := range result.State {
+			if tp.TemplateName == "worker" {
+				workerEntries++
+			}
+		}
+		// The active session is reused; the red gate blocks any additional creates.
+		if workerEntries != 1 {
+			t.Fatalf("expected exactly 1 worker entry (reused active); got %d; keys=%v stderr=%s", workerEntries, mapKeys(result.State), stderr.String())
 		}
 	})
 }
