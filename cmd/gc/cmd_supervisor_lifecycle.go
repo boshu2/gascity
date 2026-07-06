@@ -1326,12 +1326,9 @@ const supervisorLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>{{xmlesc .LogPath}}</string>
     <key>StandardErrorPath</key>
