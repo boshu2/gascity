@@ -495,6 +495,16 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 	// root cause of the 2026-06-08 town-wide wedge (ga-0eq). BD_BACKUP_ENABLED
 	// env-var suppression only covers gc's own calls, so bake it in too.
 	changed = setBool(root, "backup.enabled", false) || changed
+	// bd init auto-populates a git `sync.remote` from the scope repo's origin,
+	// and bd's post-commit sync then PUSHES bead/dolt tracker refs
+	// (refs/dolt/data, refs/heads/__dolt_remote_info__) to it. For a GC-managed
+	// store the canonical tracker is the city's Dolt server, never the code
+	// repo's git remote — so that push is always wrong, and on a public or
+	// CI/deploy-wired repo it silently leaks tracker data and fires spurious
+	// builds (observed: agentops-showcase → 2 BLOCKED Vercel deploys). Same
+	// class as the backup_export remote above: strip the whole `sync` block
+	// from the canonical config so no rig-add or reconcile can reintroduce it.
+	changed = deleteKeys(root, "sync") || changed
 	if state.EndpointOrigin != "" {
 		changed = setString(root, "gc.endpoint_origin", string(state.EndpointOrigin)) || changed
 	}

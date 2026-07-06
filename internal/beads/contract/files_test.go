@@ -391,6 +391,56 @@ func TestEnsureCanonicalConfigForcesAutoBackupOff(t *testing.T) {
 	})
 }
 
+// TestEnsureCanonicalConfigStripsGitSyncRemote locks in the rig-add leak fix:
+// bd init auto-populates a `sync.remote` from the scope repo's git origin, and
+// bd's post-commit sync then pushes bead/dolt tracker refs to it. On a public
+// or CI/deploy-wired repo that silently leaks tracker data and fires spurious
+// builds (observed on agentops-showcase: refs/dolt/data + __dolt_remote_info__
+// pushed to GitHub → 2 BLOCKED Vercel deploys). The canonical store is the
+// city's Dolt, so the whole `sync` block must be stripped at config time — not
+// just from the freshly-added rig, but on every reconcile normalization so an
+// already-leaked scope self-heals.
+func TestEnsureCanonicalConfigStripsGitSyncRemote(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// The exact nested shape bd init writes into a rig's .beads/config.yaml.
+	input := strings.Join([]string{
+		"issue-prefix: gc",
+		"dolt.auto-start: false",
+		"sync:",
+		`    remote: "git+ssh://git@github.com/boshu2/agentops-showcase.git"`,
+		"",
+	}, "\n")
+	if err := fs.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+	}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "sync:") {
+		t.Fatalf("config must strip the sync block, still present:\n%s", text)
+	}
+	if strings.Contains(text, "github.com") || strings.Contains(text, "remote:") {
+		t.Fatalf("config must not carry a git sync remote:\n%s", text)
+	}
+	// Sanity: the rest of the canonical shape is still written.
+	if !strings.Contains(text, "issue_prefix: gc") {
+		t.Fatalf("stripping sync must not drop other canonical keys:\n%s", text)
+	}
+}
+
 func TestEnsureCanonicalConfigPreservesDoltDisableEventFlushOptOut(t *testing.T) {
 	fs := fsys.OSFS{}
 	dir := t.TempDir()
