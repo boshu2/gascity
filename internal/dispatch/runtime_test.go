@@ -2673,6 +2673,176 @@ func TestProcessWorkflowFinalizeTreatsQuarantinedControlAsFailure(t *testing.T) 
 	}
 }
 
+// finalizeFixtureWithGateBlocker builds a graph.v2 workflow whose finalizer is
+// blocked by a single closed blocker bead with the given metadata, returning
+// the workflow root and finalizer. Shared by the engine-fingerprint membrane
+// tests below.
+func finalizeFixtureWithGateBlocker(t *testing.T, store beads.Store, blockerMeta map[string]string) (beads.Bead, beads.Bead) {
+	t.Helper()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	blocker := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "gate",
+		Type:     "task",
+		Status:   "closed",
+		Metadata: blockerMeta,
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, finalizer.ID, blocker.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+	return workflow, finalizer
+}
+
+// Regression guard for the legit engine path: a ralph gate closed by
+// processRalphControl's pass path carries a final gc.attempt_log entry with
+// outcome=pass, and the finalizer must keep accepting it.
+func TestProcessWorkflowFinalizeAcceptsRalphGateWithEngineFingerprint(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	// Round-trip the attempt log through the production writer so the fixture
+	// matches exactly what processRalphControl persists on its pass path.
+	attemptLog, err := appendAttemptLogValue("", 1, "fail", "check exited 1")
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue(fail): %v", err)
+	}
+	attemptLog, err = appendAttemptLogValue(attemptLog, 2, convergence.GatePass, "")
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue(pass): %v", err)
+	}
+	workflow, finalizer := finalizeFixtureWithGateBlocker(t, store, map[string]string{
+		"gc.kind":        "ralph",
+		"gc.outcome":     "pass",
+		"gc.attempt_log": attemptLog,
+	})
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("workflow = status %q outcome %q, want closed/pass", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+// Fail-closed membrane: a ralph gate bead closed with gc.outcome=pass but
+// WITHOUT the engine fingerprint (no gc.attempt_log, or a last entry that is
+// not a passing check) is an agent-minted close — the finalizer must treat it
+// as a failed blocker, never as a passing gate. Canary 2026-07-06 (workflow
+// ca-dkj): a builder closed the ralph control directly via bd with
+// gc.outcome=pass after the gate's check had exited 1.
+func TestProcessWorkflowFinalizeFailsRalphGateWithoutEngineFingerprint(t *testing.T) {
+	t.Parallel()
+
+	failLog, err := appendAttemptLogValue("", 1, "fail", "check exited 1")
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue(fail): %v", err)
+	}
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{
+			name: "no attempt log",
+			meta: map[string]string{
+				"gc.kind":    "ralph",
+				"gc.outcome": "pass",
+			},
+		},
+		{
+			name: "last attempt log entry not pass",
+			meta: map[string]string{
+				"gc.kind":        "ralph",
+				"gc.outcome":     "pass",
+				"gc.attempt_log": failLog,
+			},
+		},
+		{
+			name: "malformed attempt log",
+			meta: map[string]string{
+				"gc.kind":        "ralph",
+				"gc.outcome":     "pass",
+				"gc.attempt_log": "not-json",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := beads.NewMemStore()
+			workflow, finalizer := finalizeFixtureWithGateBlocker(t, store, tc.meta)
+
+			var traces []string
+			result, err := ProcessControl(store, finalizer, ProcessOptions{
+				Tracef: func(format string, args ...any) {
+					traces = append(traces, fmt.Sprintf(format, args...))
+				},
+			})
+			if err != nil {
+				t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+			}
+			if !result.Processed || result.Action != "workflow-fail" {
+				t.Fatalf("workflow result = %+v, want processed workflow-fail", result)
+			}
+			rootAfter := mustGetBead(t, store, workflow.ID)
+			if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "fail" {
+				t.Fatalf("workflow = status %q outcome %q, want closed/fail", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+			}
+			found := false
+			for _, tr := range traces {
+				if strings.Contains(tr, "gate fingerprint missing") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("traces = %q, want one containing %q", traces, "gate fingerprint missing")
+			}
+		})
+	}
+}
+
+// Non-ralph blockers are not gate beads: a plain step closed with
+// gc.outcome=pass and no attempt log must keep passing the finalizer.
+func TestProcessWorkflowFinalizeAcceptsNonRalphBlockerWithoutAttemptLog(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow, finalizer := finalizeFixtureWithGateBlocker(t, store, map[string]string{
+		"gc.outcome": "pass",
+	})
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("workflow = status %q outcome %q, want closed/pass", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
 func TestProcessWorkflowFinalizeOrphanedRootClosesFinalizerWithoutError(t *testing.T) {
 	t.Parallel()
 

@@ -714,7 +714,7 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 		return ControlResult{}, fmt.Errorf("%s: missing gc.root_bead_id", bead.ID)
 	}
 
-	outcome, err := resolveFinalizeOutcome(store, bead)
+	outcome, err := resolveFinalizeOutcome(store, bead, opts)
 	if err != nil {
 		if errors.Is(err, errFinalizePending) {
 			return ControlResult{}, ErrControlPending
@@ -1471,8 +1471,8 @@ func matchesScopeRef(bead beads.Bead, scopeRef string) bool {
 	return stepRef == scopeRef || strings.HasSuffix(stepRef, "."+scopeRef)
 }
 
-func resolveFinalizeOutcome(store beads.Store, finalizer beads.Bead) (string, error) {
-	outcome, err := resolveBlockedOutcome(store, finalizer.ID)
+func resolveFinalizeOutcome(store beads.Store, finalizer beads.Bead, opts ProcessOptions) (string, error) {
+	outcome, err := resolveBlockedOutcome(store, finalizer.ID, opts)
 	if err != nil {
 		return "", err
 	}
@@ -1489,7 +1489,7 @@ func resolveFinalizeOutcome(store beads.Store, finalizer beads.Bead) (string, er
 	return outcome, nil
 }
 
-func resolveBlockedOutcome(store beads.Store, beadID string) (string, error) {
+func resolveBlockedOutcome(store beads.Store, beadID string, opts ProcessOptions) (string, error) {
 	deps, err := store.DepList(beadID, "down")
 	if err != nil {
 		return "", err
@@ -1507,6 +1507,17 @@ func resolveBlockedOutcome(store beads.Store, beadID string) (string, error) {
 			return "", fmt.Errorf("%w: blocker %s is still open", errFinalizePending, blocker.ID)
 		}
 		if beadOutcomeFailed(blocker) {
+			outcome = beadmeta.OutcomeFail
+			continue
+		}
+		// Fail-closed membrane on engine-owned gate beads: a ralph control is
+		// only ever closed as passing by processRalphControl, whose pass path
+		// records the final gc.attempt_log entry with outcome=pass. A ralph
+		// blocker closed with a passing gc.outcome but without that engine
+		// fingerprint is an agent-minted close (e.g. direct bd close) and must
+		// fail the finalize outcome rather than pass a bypassed gate.
+		if blocker.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindRalph && !ralphEngineClosePass(blocker) {
+			opts.tracef("finalize: blocker %s closed-with-pass but gate fingerprint missing — treating as FAIL (agent-minted close?)", blocker.ID)
 			outcome = beadmeta.OutcomeFail
 		}
 	}

@@ -1485,6 +1485,26 @@ func appendAttemptLog(store beads.Store, controlID string, attempt int, outcome,
 	return store.SetMetadata(controlID, beadmeta.AttemptLogMetadataKey, logJSON)
 }
 
+// ralphEngineClosePass reports whether a closed ralph control bead carries the
+// engine fingerprint of a passing gate. processRalphControl's pass path is the
+// only engine writer that closes a ralph control as passing, and it always
+// records the final gc.attempt_log entry with outcome=pass (via
+// appendAttemptLogValue below). A ralph bead closed directly by an agent
+// (e.g. bd close with gc.outcome=pass) lacks that entry, so its close must not
+// satisfy the finalize membrane. Missing or malformed logs count as no
+// fingerprint: fail-closed.
+func ralphEngineClosePass(bead beads.Bead) bool {
+	raw := strings.TrimSpace(bead.Metadata[beadmeta.AttemptLogMetadataKey])
+	if raw == "" {
+		return false
+	}
+	var log []map[string]string
+	if err := json.Unmarshal([]byte(raw), &log); err != nil || len(log) == 0 {
+		return false
+	}
+	return log[len(log)-1]["outcome"] == convergence.GatePass
+}
+
 func appendAttemptLogValue(existing string, attempt int, outcome, reason string) (string, error) {
 	var log []map[string]string
 	if existing != "" {

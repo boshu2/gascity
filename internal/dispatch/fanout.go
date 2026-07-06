@@ -23,7 +23,7 @@ var fanoutVarPattern = regexp.MustCompile(`\{([^}]+)\}`)
 func processFanout(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {
 	switch bead.Metadata[beadmeta.FanoutStateMetadataKey] {
 	case beadmeta.SpawnStateSpawned:
-		outcome, err := resolveBlockedOutcome(store, bead.ID)
+		outcome, err := resolveBlockedOutcome(store, bead.ID, opts)
 		if err != nil {
 			if errors.Is(err, errFinalizePending) {
 				return ControlResult{}, nil
