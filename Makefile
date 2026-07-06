@@ -806,3 +806,12 @@ k8s-secret:
 ## help: show this help
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## //' | column -t -s ':'
+
+# --- fork-factory (boshu2/gascity owned fork; see AGENTS.md + fork-maintenance skill) ---
+.PHONY: fork-status fork-preview fork-sync
+fork-status: ## divergence vs upstream/main + owned-patch overlap warnings
+	@scripts/fork-sync.sh status
+fork-preview: ## non-mutating 3-way merge preview vs upstream/main
+	@scripts/fork-sync.sh preview
+fork-sync: ## dry-run rebase plan; ARGS=--execute rebases owned patches on a fresh branch
+	@scripts/fork-sync.sh sync $(ARGS)

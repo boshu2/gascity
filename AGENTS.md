@@ -1,5 +1,11 @@
 # Gas City
 
+> **FORK NOTICE (boshu2/gascity).** This checkout is Bo's owned fork of
+> `gastownhall/gascity` — pushable `origin`, owned `patch(...)` commits carried on `main`,
+> upstream synced via `make fork-status/preview/sync`. Read [`FORK.md`](FORK.md) for the
+> fork contract (remotes, patch list, rules) before touching remotes, branches, or `main`
+> history. Everything below is upstream's own agent contract and still applies to the code.
+
 Gas City is an orchestration-builder SDK — a Go toolkit for composing
 multi-agent coding workflows. It extracts the battle-tested subsystems from
 Steve Yegge's Gas Town (github.com/steveyegge/gastown) into a configurable
