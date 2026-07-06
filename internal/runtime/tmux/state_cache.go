@@ -189,6 +189,28 @@ func (c *StateCache) refresh() {
 
 		if err != nil {
 			log.Printf("tmux state cache: refresh failed in %v: %v", elapsed, err)
+			// A failed fetch normally preserves last-known-good for up to
+			// staleTTL. But when a cheap follow-up probe says the server is
+			// definitively GONE (no-server class), holding stale "running"
+			// sessions for 30s only delays the reconciler's restart of every
+			// session. Install the empty snapshot immediately instead.
+			if p, ok := c.fetcher.(noServerProber); ok {
+				probeCtx, probeCancel := context.WithTimeout(context.Background(), fetchTimeout)
+				gone := p.probeNoServer(probeCtx)
+				probeCancel()
+				if gone {
+					log.Printf("tmux state cache: fetch failed but server is gone; installing empty snapshot")
+					c.mu.Lock()
+					if c.generation == startGeneration {
+						c.state = runtimeStateSnapshot{Sessions: map[string]sessionRuntimeState{}}
+						c.fetchedAt = time.Now()
+						c.lastError = nil
+						c.dirty = false
+					}
+					c.mu.Unlock()
+					return nil, nil
+				}
+			}
 			c.mu.Lock()
 			c.lastError = err
 			c.mu.Unlock()
@@ -219,9 +241,26 @@ func (c *StateCache) refresh() {
 	})
 }
 
+// noServerProber is an optional StateFetcher extension: a cheap follow-up
+// probe run only after a failed fetch, reporting true when the failure is
+// definitively the no-server class (server gone, not merely slow). See the
+// refresh failure path above.
+type noServerProber interface {
+	probeNoServer(ctx context.Context) bool
+}
+
 // tmuxFetcher implements StateFetcher using a real Tmux instance.
 type tmuxFetcher struct {
 	tm *Tmux
+}
+
+// probeNoServer reports whether the tmux server is definitively gone: a
+// has-session against an unrouteable name answers ErrNoServer only when no
+// server is bound to the socket. A wedged-but-alive server hangs or errors
+// differently and returns false (keep last-known-good).
+func (f *tmuxFetcher) probeNoServer(ctx context.Context) bool {
+	_, err := f.tm.runCtx(ctx, "has-session", "-t", "="+probeSessionName)
+	return errors.Is(err, ErrNoServer)
 }
 
 // FetchState runs one tmux pane snapshot and one process-table snapshot.

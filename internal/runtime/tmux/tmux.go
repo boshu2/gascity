@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -175,6 +176,37 @@ var newSessionProbeTimeout = 2 * time.Second
 // returns something else. The name is deliberately unrouteable.
 const probeSessionName = "__gascity_probe__"
 
+// degradedLatchProbes is how many CONSECUTIVE probeServerAlive degraded
+// results are required before degraded-server recovery latches. Any healthy
+// probe result resets the streak. Paired with degradedLatchWindow: both
+// conditions must hold, so a burst of retries within one Start attempt can
+// never trip recovery on its own.
+const degradedLatchProbes = 3
+
+// degradedLatchWindow is the minimum wall-clock span the consecutive degraded
+// probes must cover before recovery latches. Together with
+// degradedLatchProbes this bounds how long a wedged server can hold every
+// session Start hostage (previously: forever — ErrServerDegraded had no
+// remediation and recovery rode the 5m-30m wake-failure quarantine ladder).
+// Test-overridable.
+var degradedLatchWindow = 90 * time.Second
+
+// recoverKillServerTimeout bounds the kill-server step of degraded-server
+// recovery. A server wedged enough to trip the latch is likely to also hang
+// kill-server; the short timeout lets recovery escalate to SIGKILL instead of
+// blocking on the wedge. Test-overridable.
+var recoverKillServerTimeout = 5 * time.Second
+
+// processStartTimeFn is a test seam over processStartTime so recovery tests
+// can fake process identity without real PIDs.
+var processStartTimeFn = processStartTime
+
+// recoverSigkillFn is the SIGKILL seam for degraded-server recovery. Tests
+// replace it with a recorder so no real process is ever signaled.
+var recoverSigkillFn = func(pid string) error {
+	return exec.Command("kill", "-KILL", pid).Run()
+}
+
 // validateSessionName checks that a session name contains only safe characters.
 // Returns ErrInvalidSessionName if the name contains dots, colons, or other
 // characters that cause tmux to silently fail or produce cryptic errors.
@@ -239,6 +271,22 @@ type Tmux struct {
 	// agentSlice wraps pane commands in a transient systemd user scope when
 	// GC_AGENT_SLICE is set (see AgentSliceEnv in agent_slice.go).
 	agentSlice agentSliceWrapper
+
+	// degradedMu guards the degraded-server latch state below plus the
+	// cached healthy-server identity (serverPID/serverPIDStart).
+	degradedMu sync.Mutex
+	// degradedCount is the current streak of consecutive probeServerAlive
+	// degraded results; any healthy probe resets it.
+	degradedCount int
+	// degradedFirstAt is when the current degraded streak started.
+	degradedFirstAt time.Time
+	// serverPID is the tmux server PID cached by ConfigureServer while the
+	// server was healthy — the SIGKILL target if kill-server later wedges.
+	serverPID string
+	// serverPIDStart is serverPID's start-time identity at cache time (same
+	// normalization as processStartTime), re-verified before any SIGKILL so
+	// a recycled PID is never signaled.
+	serverPIDStart string
 }
 
 // pokeInfo records a gc-initiated send-keys ("poke", e.g. a wake or nudge) to a
@@ -362,21 +410,152 @@ func (t *Tmux) probeServerAlive() error {
 	if err == nil {
 		// Server is alive and (improbably) actually has a session with the
 		// probe name. Still safe — server responded.
+		t.resetDegradedLatch()
 		return nil
 	}
 	if errors.Is(err, ErrSessionNotFound) {
 		// Healthy server, just doesn't have the probe session. Safe.
+		t.resetDegradedLatch()
 		return nil
 	}
 	if errors.Is(err, ErrNoServer) {
 		// No server bound (stale socket or never existed). Safe — tmux will
 		// unlink any stale socket and bind a fresh server.
+		t.resetDegradedLatch()
 		return nil
 	}
 	// Timeout, fork failure, or any other unrecognized error: server is in
 	// an indeterminate state. Refuse to proceed rather than let tmux silently
-	// fork into a parallel server.
+	// fork into a parallel server. Record the degraded result: enough
+	// consecutive results over enough wall-clock time trips bounded recovery
+	// (see noteDegradedProbe) instead of refusing session Starts forever.
+	t.noteDegradedProbe()
 	return fmt.Errorf("%w (socket=%s): %w", ErrServerDegraded, t.cfg.SocketName, err)
+}
+
+// resetDegradedLatch clears the degraded-probe streak. Called on every
+// healthy probe result so only CONSECUTIVE degraded results accumulate.
+func (t *Tmux) resetDegradedLatch() {
+	t.degradedMu.Lock()
+	t.degradedCount = 0
+	t.degradedFirstAt = time.Time{}
+	t.degradedMu.Unlock()
+}
+
+// noteDegradedProbe records one degraded probeServerAlive result. When the
+// latch trips — at least degradedLatchProbes consecutive degraded results
+// spanning at least degradedLatchWindow — it resets the latch and runs
+// recoverDegradedServer exactly once per trip. The latch reset means a fresh
+// degraded streak must fully re-arm before recovery can fire again, bounding
+// recovery to one attempt per (probes × window) episode.
+func (t *Tmux) noteDegradedProbe() {
+	t.degradedMu.Lock()
+	t.degradedCount++
+	if t.degradedCount == 1 {
+		t.degradedFirstAt = time.Now()
+	}
+	trip := t.degradedCount >= degradedLatchProbes &&
+		time.Since(t.degradedFirstAt) >= degradedLatchWindow
+	var pid, pidStart string
+	if trip {
+		t.degradedCount = 0
+		t.degradedFirstAt = time.Time{}
+		pid, pidStart = t.serverPID, t.serverPIDStart
+	}
+	t.degradedMu.Unlock()
+	if trip {
+		t.recoverDegradedServer(pid, pidStart)
+	}
+}
+
+// recoverDegradedServer is the bounded escalation that replaces permanent
+// spawn refusal once the degraded latch trips. Steps, each logged distinctly:
+//
+//  1. kill-server through the normal socket-scoped run path with a short
+//     timeout (a wedged server may hang even this);
+//  2. if that fails and a healthy-server PID was cached by ConfigureServer,
+//     SIGKILL that PID directly — identity-verified first so a recycled PID
+//     is never signaled (killIdentityMatches, the session-massacre seam);
+//  3. unlink the socket file so the next new-session binds a fresh server
+//     instead of tmux racing the corpse on the same path.
+//
+// Everything is scoped to t.cfg.SocketName; other sockets/servers are never
+// touched.
+func (t *Tmux) recoverDegradedServer(pid, pidStart string) {
+	log.Printf("tmux: degraded-server latch tripped (socket=%s): attempting kill-server", t.cfg.SocketName)
+	ctx, cancel := context.WithTimeout(context.Background(), recoverKillServerTimeout)
+	_, err := t.runCtx(ctx, "kill-server")
+	cancel()
+	if err != nil && !errors.Is(err, ErrNoServer) {
+		log.Printf("tmux: degraded-server recovery: kill-server failed (socket=%s): %v", t.cfg.SocketName, err)
+		t.sigkillCachedServer(pid, pidStart)
+	}
+	t.unlinkDegradedSocket()
+}
+
+// sigkillCachedServer SIGKILLs the cached healthy-server PID, but only after
+// re-verifying identity: with a cached start time, the PID must still report
+// exactly that start time (killIdentityMatches); without one, the process
+// comm must at least be tmux. A recycled or unknown PID is never signaled.
+func (t *Tmux) sigkillCachedServer(pid, pidStart string) {
+	if pid == "" {
+		log.Printf("tmux: degraded-server recovery: no cached server PID; skipping SIGKILL (socket=%s)", t.cfg.SocketName)
+		return
+	}
+	if pidStart != "" {
+		if !killIdentityMatches(processStartTimeFn(pid), pidStart) {
+			log.Printf("tmux: degraded-server recovery: cached PID %s identity mismatch (recycled?); skipping SIGKILL (socket=%s)", pid, t.cfg.SocketName)
+			return
+		}
+	} else if comm := processComm(pid); !strings.HasPrefix(comm, "tmux") {
+		log.Printf("tmux: degraded-server recovery: cached PID %s comm=%q is not tmux; skipping SIGKILL (socket=%s)", pid, comm, t.cfg.SocketName)
+		return
+	}
+	log.Printf("tmux: degraded-server recovery: SIGKILL cached server PID %s (socket=%s)", pid, t.cfg.SocketName)
+	if err := recoverSigkillFn(pid); err != nil {
+		log.Printf("tmux: degraded-server recovery: SIGKILL %s failed: %v", pid, err)
+	}
+}
+
+// unlinkDegradedSocket removes this Tmux instance's OWN socket file so the
+// next new-session binds a fresh server. Scoped strictly to
+// t.cfg.SocketName under the standard tmux socket dir; no-op when unset.
+func (t *Tmux) unlinkDegradedSocket() {
+	path := t.socketPath()
+	if path == "" {
+		return
+	}
+	switch err := os.Remove(path); {
+	case err == nil:
+		log.Printf("tmux: degraded-server recovery: unlinked socket %s", path)
+	case !os.IsNotExist(err):
+		log.Printf("tmux: degraded-server recovery: unlink %s failed: %v", path, err)
+	}
+}
+
+// socketPath resolves the filesystem path of the -L SocketName socket using
+// tmux's own convention: $TMUX_TMPDIR (default /tmp)/tmux-<uid>/<name>.
+// Returns "" when SocketName is unset (default server — out of scope).
+func (t *Tmux) socketPath() string {
+	if t.cfg.SocketName == "" {
+		return ""
+	}
+	dir := os.Getenv("TMUX_TMPDIR")
+	if dir == "" {
+		dir = "/tmp"
+	}
+	return filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()), t.cfg.SocketName)
+}
+
+// processComm returns pid's process command name (ps comm), or "" when the
+// process is gone. Used as the identity fallback before SIGKILL when no
+// start-time was cached.
+func processComm(pid string) string {
+	out, err := exec.Command("ps", "-o", "comm=", "-p", pid).Output()
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(strings.TrimSpace(string(out)))
 }
 
 // NewSession creates a new detached tmux session.
@@ -1005,8 +1184,27 @@ func (t *Tmux) ConfigureServer() error {
 	var err error
 	t.configureOnce.Do(func() {
 		err = t.SetExitEmpty(false)
+		t.cacheServerPID()
 	})
 	return err
+}
+
+// cacheServerPID records the server PID (and its start-time identity) while
+// the server is known healthy — ConfigureServer runs right after a
+// successful new-session. Degraded-server recovery uses this as the
+// identity-verified SIGKILL target when kill-server itself wedges. Best
+// effort: on any failure the cache is simply left empty and recovery skips
+// the SIGKILL step.
+func (t *Tmux) cacheServerPID() {
+	out, err := t.run("display-message", "-p", "#{pid}")
+	if err != nil || out == "" {
+		return
+	}
+	start := processStartTimeFn(out)
+	t.degradedMu.Lock()
+	t.serverPID = out
+	t.serverPIDStart = start
+	t.degradedMu.Unlock()
 }
 
 // TeardownServer terminates the tmux server after all sessions are drained.
