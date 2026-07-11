@@ -16,6 +16,41 @@ type fileData struct {
 	Seq   int    `json:"seq"`
 	Beads []Bead `json:"beads"`
 	Deps  []Dep  `json:"deps,omitempty"`
+	// Revisions persists each bead's ConditionalWriter revision out of band,
+	// because Bead.Revision is json:"-" and never survives the on-disk []Bead.
+	// Without this, every reloadFromDisk (which runs before each write in
+	// cross-process flock mode) would reset all revisions to 0, breaking the
+	// monotonic-never-reused contract. Absent (legacy files) ≡ all zero.
+	Revisions map[string]int64 `json:"revisions,omitempty"`
+}
+
+// beadRevisions extracts the out-of-band revision map for persistence. Zero
+// revisions are omitted (absent ≡ 0 on reload), so legacy files round-trip.
+func beadRevisions(beads []Bead) map[string]int64 {
+	revs := make(map[string]int64, len(beads))
+	for _, b := range beads {
+		if b.Revision != 0 {
+			revs[b.ID] = b.Revision
+		}
+	}
+	if len(revs) == 0 {
+		return nil
+	}
+	return revs
+}
+
+// applyBeadRevisions stamps persisted revisions back onto beads decoded from
+// disk, whose Revision fields are all 0 because of the json:"-" tag. Beads with
+// no entry keep revision 0, matching files that predate the revisions map.
+func applyBeadRevisions(beads []Bead, revs map[string]int64) {
+	if len(revs) == 0 {
+		return
+	}
+	for i := range beads {
+		if r, ok := revs[beads[i].ID]; ok {
+			beads[i].Revision = r
+		}
+	}
 }
 
 // FileStore is a file-backed Store implementation. It embeds a MemStore for
@@ -84,6 +119,7 @@ func OpenFileStore(fs fsys.FS, path string) (*FileStore, error) {
 	if err := json.Unmarshal(data, &fd); err != nil {
 		return nil, fmt.Errorf("opening file store: %w", err)
 	}
+	applyBeadRevisions(fd.Beads, fd.Revisions)
 	store := &FileStore{
 		MemStore: NewMemStoreFrom(fd.Seq, fd.Beads, fd.Deps),
 		fs:       fs,
@@ -120,6 +156,7 @@ func (fs *FileStore) reloadFromDisk() error {
 	if err := json.Unmarshal(data, &fd); err != nil {
 		return fmt.Errorf("reloading file store: %w", err)
 	}
+	applyBeadRevisions(fd.Beads, fd.Revisions)
 	fs.restoreFrom(fd.Seq, fd.Beads, fd.Deps)
 	return nil
 }
@@ -576,7 +613,7 @@ func (fs *FileStore) save() error {
 	seq, beads, deps := fs.snapshot()
 	fs.mu.Unlock()
 
-	fd := fileData{Seq: seq, Beads: beads, Deps: deps}
+	fd := fileData{Seq: seq, Beads: beads, Deps: deps, Revisions: beadRevisions(beads)}
 	data, err := json.MarshalIndent(fd, "", "  ")
 	if err != nil {
 		return fmt.Errorf("saving file store: %w", err)

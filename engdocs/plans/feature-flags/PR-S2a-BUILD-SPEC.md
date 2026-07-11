@@ -9,6 +9,13 @@ behavior byte-identical (there is no mode at this layer — stores just gain a
 capability). No code path converts `ErrConditionalWriteUnsupported` into an
 unconditional write.
 
+## Progress (committed on worktree-reconciler, local/unpushed)
+- **docs** `44eb2ab70` — this spec.
+- **Phase 1 (S2-T1)** `bec9156b1` — interface + 4 typed errors + `Bead.Revision json:"-"` + `bdIssue` stamping + `ConditionalWriterFor`. Red-teamed (F1 contract carve-out, F5/F4a/F6 doc fixes folded; F2 Doltlite promotion = bd `ga-zj78gu`).
+- **Phase 2+3a (S2-T2, S2-T3-mem)** `ec0bccd04` — conformance harness + MemStore native CAS. Red-teamed + teeth-proven by mutation (T1 success-path subtest, T2 adaptive close/reopen, T3 Expected-unconditional + `SuppliesCurrent`, T4 16-racer+winner-value, T5 wide bump table, D1 FileStore shadow, D2 disable-under-lock).
+- **Phase 3b (S2-T3-file)** — FileStore native CAS (flock-wrapped reload→save→rollback, replacing the 3a shadow) + out-of-band `fileData.Revisions` persistence (F4b). Red-teamed: production code confirmed correct; the cross-process teeth were missing (all tests were single-handle), so added `TestFileStoreConditionalWriteCrossHandle` (two handles, kills a deleted reload AND a deleted save — both mutation-proven), a 2-bead reopen test (kills per-bead map bugs, mutation-proven), and a legacy-file (no `revisions` key) compat test.
+- **Remaining:** Phase 4 (S2-T4/T5 BdStore classifier+probe), Phase 5 (S2-T6/T7 verbs+CAS emulation+spike note), Phase 6 (S2-T8 CachingStore evict-never-patch). Then PR-S2b (S2-T10..T12). S2-T9 sqlite deferred out of S2.
+
 ## Resolved decisions (OVERRIDE stale plan wording)
 1. `Revision int64 \`json:"-"\`` on `beads.Bead`. Verified: `beads.Bead` IS the
    Huma response type (`ListOutput[beads.Bead]`, huma_handlers_beads.go:18/211),
