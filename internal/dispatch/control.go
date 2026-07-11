@@ -310,7 +310,40 @@ func syncControlEpochToAttempt(store beads.Store, control, attempt beads.Bead) e
 	if err != nil || attemptNum <= current {
 		return nil
 	}
-	return store.SetMetadata(control.ID, beadmeta.ControlEpochMetadataKey, strconv.Itoa(attemptNum))
+	writer, _, resolveErr := beads.ResolveConditionalWriter(store)
+	if resolveErr != nil {
+		return fmt.Errorf("syncing control epoch on %s: %w", control.ID, resolveErr)
+	}
+	if writer == nil {
+		return store.SetMetadata(control.ID, beadmeta.ControlEpochMetadataKey, strconv.Itoa(attemptNum))
+	}
+	// Bounded to one re-issue from a fresh read: losing the CAS is benign
+	// (another processor advanced the epoch first), but a conflict that keeps
+	// recurring with a still-stale epoch is cross-key revision interference
+	// and must surface as transient rather than loop (level-triggered passes
+	// re-enter).
+	const syncAttempts = 2
+	expected := current
+	for attempt := 1; attempt <= syncAttempts; attempt++ {
+		ok, casErr := writer.CompareAndSetMetadataKey(control.ID, beadmeta.ControlEpochMetadataKey,
+			strconv.Itoa(expected), strconv.Itoa(attemptNum))
+		if ok {
+			return nil
+		}
+		if casErr != nil && !beads.IsPreconditionFailed(casErr) {
+			return fmt.Errorf("syncing control epoch on %s: %w", control.ID, casErr)
+		}
+		refreshed, getErr := store.Get(control.ID)
+		if getErr != nil {
+			return getErr
+		}
+		refreshedEpoch, err := strconv.Atoi(strings.TrimSpace(refreshed.Metadata[beadmeta.ControlEpochMetadataKey]))
+		if err != nil || refreshedEpoch >= attemptNum {
+			return nil
+		}
+		expected = refreshedEpoch
+	}
+	return fmt.Errorf("syncing control epoch on %s: conditional advance kept conflicting below attempt %d", control.ID, attemptNum)
 }
 
 func markControllerSpawnError(store beads.Store, beadID string, err error, opts ProcessOptions) bool {

@@ -1242,7 +1242,69 @@ func reserveDrainMember(store beads.Store, control, member beads.Bead, opts Proc
 	if owner == control.ID {
 		return nil
 	}
-	return memberStore.SetMetadata(member.ID, beadmeta.ExclusiveDrainReservationMetadataKey, control.ID)
+	return claimDrainReservation(memberStore, control, member)
+}
+
+// claimDrainReservation claims the empty reservation slot. When the member's
+// owning store resolves a conditional writer (beads.conditional_writes auto or
+// require on a capable store), the claim is a value-CAS so two racing drains
+// cannot both observe an empty owner and both stamp; otherwise it is the
+// byte-identical legacy write. A require-mode refusal surfaces as-is — the
+// drain fails closed rather than issuing an unconditional claim.
+func claimDrainReservation(memberStore beads.Store, control, member beads.Bead) error {
+	writer, _, err := beads.ResolveConditionalWriter(memberStore)
+	if err != nil {
+		return fmt.Errorf("%s: reserving drain member %s: %w", control.ID, member.ID, err)
+	}
+	if writer == nil {
+		return memberStore.SetMetadata(member.ID, beadmeta.ExclusiveDrainReservationMetadataKey, control.ID)
+	}
+	return claimDrainReservationCAS(memberStore, writer, control, member)
+}
+
+// claimDrainReservationCAS fences the claim. A failed CAS is an observation,
+// never a loss verdict by itself: the reservation value identifies its writer
+// (control.ID), so the claim re-reads and re-decides — our own value means
+// self-win (idempotent re-entry, or our own committed-but-unacknowledged
+// write on an ambiguous transport error); a still-empty owner means a
+// spurious conflict (a raced release, or cross-key revision interference on
+// stores that emulate value-CAS over a whole-bead fence), re-issued once
+// before surfacing; anything else is a genuine competing reservation.
+func claimDrainReservationCAS(memberStore beads.Store, writer beads.ConditionalWriter, control, member beads.Bead) error {
+	const claimAttempts = 2
+	var lastErr error
+	for attempt := 1; attempt <= claimAttempts; attempt++ {
+		ok, casErr := writer.CompareAndSetMetadataKey(member.ID, beadmeta.ExclusiveDrainReservationMetadataKey, "", control.ID)
+		if ok {
+			return nil
+		}
+		lastErr = casErr
+		current, getErr := memberStore.Get(member.ID)
+		if getErr != nil {
+			if casErr != nil {
+				return fmt.Errorf("%s: reserving drain member %s: %w", control.ID, member.ID, casErr)
+			}
+			return fmt.Errorf("%s: re-reading drain member %s after conditional claim: %w", control.ID, member.ID, getErr)
+		}
+		switch owner := strings.TrimSpace(current.Metadata[beadmeta.ExclusiveDrainReservationMetadataKey]); {
+		case owner == control.ID:
+			// Self-win: the value is ours — an ambiguous transport error whose
+			// write committed, or a concurrent re-entry of this same drain.
+			return nil
+		case owner != "":
+			return drainReservationError{ControlID: control.ID, MemberID: member.ID, Owner: owner}
+		}
+		// Owner still empty: spurious conflict. A non-precondition error is
+		// surfaced (transport/exhaustion — the level-triggered pass retries);
+		// a precondition/value-loss gets one bounded re-issue.
+		if casErr != nil && !beads.IsPreconditionFailed(casErr) {
+			return fmt.Errorf("%s: reserving drain member %s: %w", control.ID, member.ID, casErr)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("conditional claim kept losing with an empty owner")
+	}
+	return fmt.Errorf("%s: reserving drain member %s: %w", control.ID, member.ID, lastErr)
 }
 
 func reserveDrainMembers(store beads.Store, control beads.Bead, members []beads.Bead, opts ProcessOptions) error {
@@ -1270,21 +1332,63 @@ func releaseDrainReservations(store beads.Store, controlID string, manifest drai
 		if err != nil {
 			return fmt.Errorf("%s: resolving drain member store for %s: %w", controlID, memberID, err)
 		}
+		if err := releaseDrainReservation(memberStore, controlID, memberID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// releaseDrainReservation clears this control's reservation on one member.
+// The fenced form is symmetric with the claim: CAS(controlID → ""), and
+// LOSING that CAS is the correct outcome — the member was already re-claimed
+// by a successor drain, which is precisely the case where clearing it would
+// clobber; the loss is never retried. The legacy form preserves the original
+// read-verify-clear byte-for-byte.
+func releaseDrainReservation(memberStore beads.Store, controlID, memberID string) error {
+	writer, _, err := beads.ResolveConditionalWriter(memberStore)
+	if err != nil {
+		return err
+	}
+	if writer == nil {
 		member, err := memberStore.Get(memberID)
 		if err != nil {
 			if errors.Is(err, beads.ErrNotFound) {
-				continue
+				return nil
 			}
 			return fmt.Errorf("%s: loading drain member %s for reservation release: %w", controlID, memberID, err)
 		}
 		if strings.TrimSpace(member.Metadata[beadmeta.ExclusiveDrainReservationMetadataKey]) != controlID {
-			continue
+			return nil
 		}
 		if err := memberStore.SetMetadata(memberID, beadmeta.ExclusiveDrainReservationMetadataKey, ""); err != nil {
 			return fmt.Errorf("%s: releasing drain reservation on %s: %w", controlID, memberID, err)
 		}
+		return nil
 	}
-	return nil
+	ok, casErr := writer.CompareAndSetMetadataKey(memberID, beadmeta.ExclusiveDrainReservationMetadataKey, controlID, "")
+	if ok {
+		return nil
+	}
+	if casErr == nil || beads.IsPreconditionFailed(casErr) {
+		// Value loss or revision conflict: we no longer own the slot (already
+		// cleared, or a successor re-claimed it). Clearing now would clobber —
+		// the loss IS the release goal being moot.
+		return nil
+	}
+	if errors.Is(casErr, beads.ErrNotFound) {
+		return nil
+	}
+	// Ambiguous transport errors may have committed our clear: verify before
+	// surfacing (§9.3 — never conclude from the error alone).
+	if member, getErr := memberStore.Get(memberID); getErr == nil {
+		if strings.TrimSpace(member.Metadata[beadmeta.ExclusiveDrainReservationMetadataKey]) != controlID {
+			return nil
+		}
+	} else if errors.Is(getErr, beads.ErrNotFound) {
+		return nil
+	}
+	return fmt.Errorf("%s: releasing drain reservation on %s: %w", controlID, memberID, casErr)
 }
 
 func closeDrainReservationFailure(store beads.Store, bead beads.Bead, manifest drainManifest, err error, opts ProcessOptions) (ControlResult, error) {
