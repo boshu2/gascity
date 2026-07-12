@@ -662,6 +662,7 @@ exhaustion closes the step as failed.
 | `check.mode` | Checker implementation; only `"exec"` is supported |
 | `check.path` | Repo-relative or absolute script path to execute |
 | `check.timeout` | Script execution bound (e.g. `"2m"`); takes precedence over the step's `timeout` |
+| `metadata.gc.check_hold_exit_code` | Optional positive exit code that closes the check as terminal `hold` without spawning another attempt |
 
 ```toml
 formula = "checked"
@@ -681,6 +682,13 @@ mode = "exec"
 path = "scripts/verify.sh"
 timeout = "2m"
 ```
+
+Ordinary nonzero exits consume retry attempts. A step may opt into a terminal,
+fail-closed HOLD by setting `metadata = { "gc.check_hold_exit_code" = "5" }`
+and returning exit 5 from its exec check. The dispatcher closes the check and
+logical step as failed with `gc.final_disposition=hold`; it does not clone the
+next iteration. Without the metadata opt-in, exit 5 remains an ordinary
+retryable failure for backward compatibility.
 
 Materialization: the compiler emits a spec sidecar (`<step>.spec`, kind
 `spec`, carrying the serialized step definition), the first iteration

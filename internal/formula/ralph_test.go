@@ -17,7 +17,8 @@ func TestApplyRalph_Basic(t *testing.T) {
 			Needs:       []string{"setup"},
 			Labels:      []string{"frontend"},
 			Metadata: map[string]string{
-				"custom": "value",
+				"custom":                  "value",
+				"gc.check_hold_exit_code": "5",
 			},
 			Ralph: &RalphSpec{
 				MaxAttempts: 3,
@@ -63,6 +64,9 @@ func TestApplyRalph_Basic(t *testing.T) {
 	}
 	if control.Metadata["gc.control_epoch"] != "1" {
 		t.Errorf("control gc.control_epoch = %q, want 1", control.Metadata["gc.control_epoch"])
+	}
+	if control.Metadata["gc.check_hold_exit_code"] != "5" {
+		t.Errorf("control gc.check_hold_exit_code = %q, want 5", control.Metadata["gc.check_hold_exit_code"])
 	}
 	if control.Metadata["gc.source_step_spec"] != "" {
 		t.Fatalf("control gc.source_step_spec = %q, want empty", control.Metadata["gc.source_step_spec"])

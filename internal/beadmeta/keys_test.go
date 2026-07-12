@@ -56,6 +56,7 @@ func TestPinnedValues(t *testing.T) {
 		RootBeadIDMetadataKey:        "gc.root_bead_id",
 		StepRefMetadataKey:           "gc.step_ref",
 		OutcomeMetadataKey:           "gc.outcome",
+		CheckHoldExitCodeMetadataKey: "gc.check_hold_exit_code",
 		RoutedToMetadataKey:          "gc.routed_to",
 		ScopeRefMetadataKey:          "gc.scope_ref",
 		AttemptMetadataKey:           "gc.attempt",

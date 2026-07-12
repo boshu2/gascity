@@ -93,6 +93,12 @@ const (
 	GateError   = "error"
 )
 
+// GateHoldExitCode is the conventional exec-check exit code for a terminal,
+// fail-closed HOLD. It is active only when the check control explicitly opts
+// in through gc.check_hold_exit_code; otherwise exit 5 remains an ordinary
+// retryable failure for backward compatibility.
+const GateHoldExitCode = 5
+
 // WaitingReason values for convergence.waiting_reason.
 const (
 	WaitManual            = "manual"

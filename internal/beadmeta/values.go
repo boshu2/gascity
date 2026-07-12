@@ -118,6 +118,7 @@ const (
 // shares its string with OutcomePass but is a distinct domain.
 const (
 	DispositionPass              = "pass"
+	DispositionHold              = "hold"
 	DispositionHardFail          = "hard_fail"
 	DispositionSoftFail          = "soft_fail"
 	DispositionControllerError   = "controller_error"

@@ -72,6 +72,7 @@ func TestPinnedVocabularyValues(t *testing.T) {
 		SpawnStateSpawning:              "spawning",
 		SpawnStateSpawned:               "spawned",
 		DispositionPass:                 "pass",
+		DispositionHold:                 "hold",
 		DispositionHardFail:             "hard_fail",
 		DispositionSoftFail:             "soft_fail",
 		DispositionControllerError:      "controller_error",

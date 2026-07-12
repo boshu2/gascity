@@ -26,6 +26,8 @@ Each owned commit is prefixed `patch(<area>):` and ALSO preserved as a `.patch` 
 2. `patch(tmux)` atomic-snapshot + identity-verified session teardown — fixes the PID-reuse kill-massacre TOCTOU (2026-07-06 session-massacre RCA).
 3. `patch(beads)` strip bd `sync.remote` from canonical config — rig-add public-repo dolt-ref leak.
 4. `patch(tmux)` pure `killIdentityMatches` seam + PID-reuse skip table test.
+5. `patch(dispatch)` opt-in terminal HOLD exit for checked-step escalation — closes the
+   logical step without spawning another retry while preserving default nonzero semantics.
 
 ## Fork factory (sync discipline)
 

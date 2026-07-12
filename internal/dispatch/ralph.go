@@ -77,6 +77,26 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 		return ControlResult{Processed: true, Action: "pass"}, nil
 	}
 
+	holdExitCode, _ := strconv.Atoi(bead.Metadata[beadmeta.CheckHoldExitCodeMetadataKey])
+	if holdExitCode > 0 && result.ExitCode != nil && *result.ExitCode == holdExitCode {
+		if err := store.SetMetadataBatch(logicalID, map[string]string{
+			beadmeta.OutcomeMetadataKey:          beadmeta.OutcomeFail,
+			beadmeta.FailedAttemptMetadataKey:    strconv.Itoa(attempt),
+			beadmeta.FailureClassMetadataKey:     beadmeta.FailureClassHard,
+			beadmeta.FailureReasonMetadataKey:    "gate_hold",
+			beadmeta.FinalDispositionMetadataKey: beadmeta.DispositionHold,
+		}); err != nil {
+			return ControlResult{}, fmt.Errorf("%s: marking logical hold: %w", logicalID, err)
+		}
+		if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomeFail); err != nil {
+			return ControlResult{}, fmt.Errorf("%s: closing held check: %w", bead.ID, err)
+		}
+		if err := setOutcomeAndClose(store, logicalID, beadmeta.OutcomeFail); err != nil {
+			return ControlResult{}, fmt.Errorf("%s: closing held logical bead: %w", logicalID, err)
+		}
+		return ControlResult{Processed: true, Action: "hold"}, nil
+	}
+
 	if attempt >= maxAttempts {
 		if err := store.SetMetadataBatch(logicalID, map[string]string{
 			beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,

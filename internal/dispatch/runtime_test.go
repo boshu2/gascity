@@ -4186,6 +4186,74 @@ func TestProcessRalphCheckRetriesThenPasses(t *testing.T) {
 	}
 }
 
+func TestProcessRalphCheckHoldExitStopsWithoutRetry(t *testing.T) {
+	t.Parallel()
+
+	cityPath := t.TempDir()
+	checkPath := writeCheckScript(t, cityPath, "hold-check.sh", "#!/bin/bash\nset -euo pipefail\nexit 5\n")
+	store, logical, run1, check1 := newSimpleRalphLoop(t, "implement", checkPath, 10)
+	if err := store.SetMetadata(check1.ID, "gc.check_hold_exit_code", "5"); err != nil {
+		t.Fatalf("configure hold exit: %v", err)
+	}
+	check1 = mustGetBead(t, store, check1.ID)
+
+	if err := store.Close(run1.ID); err != nil {
+		t.Fatalf("close run1: %v", err)
+	}
+	result, err := ProcessControl(store, check1, ProcessOptions{CityPath: cityPath})
+	if err != nil {
+		t.Fatalf("ProcessControl(check1): %v", err)
+	}
+	if !result.Processed || result.Action != "hold" {
+		t.Fatalf("result = %+v, want processed hold", result)
+	}
+
+	checkAfter := mustGetBead(t, store, check1.ID)
+	if checkAfter.Status != "closed" || checkAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("check = status %q outcome %q, want closed/fail", checkAfter.Status, checkAfter.Metadata["gc.outcome"])
+	}
+	logicalAfter := mustGetBead(t, store, logical.ID)
+	if logicalAfter.Status != "closed" || logicalAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("logical = status %q outcome %q, want closed/fail", logicalAfter.Status, logicalAfter.Metadata["gc.outcome"])
+	}
+	if got := logicalAfter.Metadata["gc.final_disposition"]; got != "hold" {
+		t.Fatalf("logical final disposition = %q, want hold", got)
+	}
+	if got := logicalAfter.Metadata["gc.failed_attempt"]; got != "1" {
+		t.Fatalf("logical failed attempt = %q, want 1", got)
+	}
+	if got := logicalAfter.Metadata["gc.next_attempt"]; got != "" {
+		t.Fatalf("logical next attempt = %q, want no retry", got)
+	}
+	all, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("list after hold: %v", err)
+	}
+	for _, bead := range all {
+		if bead.Metadata["gc.logical_bead_id"] == logical.ID && bead.Metadata["gc.attempt"] == "2" {
+			t.Fatalf("unexpected retry bead created after hold: %s", bead.ID)
+		}
+	}
+}
+
+func TestProcessRalphCheckExitFiveRetriesWithoutHoldOptIn(t *testing.T) {
+	t.Parallel()
+
+	cityPath := t.TempDir()
+	checkPath := writeCheckScript(t, cityPath, "plain-five-check.sh", "#!/bin/bash\nset -euo pipefail\nexit 5\n")
+	store, _, run1, check1 := newSimpleRalphLoop(t, "implement", checkPath, 2)
+	if err := store.Close(run1.ID); err != nil {
+		t.Fatalf("close run1: %v", err)
+	}
+	result, err := ProcessControl(store, check1, ProcessOptions{CityPath: cityPath})
+	if err != nil {
+		t.Fatalf("ProcessControl(check1): %v", err)
+	}
+	if !result.Processed || result.Action != "retry" {
+		t.Fatalf("result = %+v, want ordinary retry without hold opt-in", result)
+	}
+}
+
 func TestProcessRalphCheckTransientAppendErrorStaysOpenForRetry(t *testing.T) {
 	t.Parallel()
 
