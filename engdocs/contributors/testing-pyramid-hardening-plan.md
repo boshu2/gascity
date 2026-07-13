@@ -1,9 +1,10 @@
 # Testing Pyramid Audit and Hardening Plan
 
 - **Status:** Proposed
-- **Audit date:** 2026-07-12
-- **Audit base:** `origin/main` at `27918189c`
-- **Tracking bead:** `ga-c4ky0l`
+- **Audit date:** 2026-07-13
+- **Audit base:** `origin/main` at `8dadc511b` (after PR #4193)
+- **Audit bead:** `ga-c4ky0l` (closed)
+- **Implementation epic:** `ga-80po0c` (open)
 
 ## Executive verdict
 
@@ -11,20 +12,22 @@ Gas City has unusually broad test coverage, good hermetic-fixture instincts, and
 several strong shared conformance suites. It does not have a weak-testing
 problem. It has an inverted-cost and unclear-ownership problem.
 
-The default checkout contains 1,543 Go test files and 733,537 lines of Go test
-code, 1.72 times the 427,497 lines of production Go. More than 43% of all test
-code lives in `cmd/gc`; that one package produces a 293 MB test binary, needs
-about 4.1 GB of memory to compile, and took 55 seconds merely to compile in a
-warm local measurement. Much of that package tests domain decisions through
-CLI globals, environment variables, subprocesses, mutable mega-fakes, and
-polling. Splitting its test files or adding shards does not remove that package
-tax.
+The default checkout contains 1,548 Go test files and 735,025 lines of Go test
+code, 1.72 times the 428,004 lines of production Go. The `cmd/gc` package alone
+contains 317,712 test lines, 43.2% of all test Go; it produces a 293 MB test
+binary, needs about 4.1 GB of memory to compile, and took 55 seconds merely to
+compile in a warm local measurement. Much of that package tests domain
+decisions through CLI globals, environment variables, subprocesses, mutable
+mega-fakes, and polling. Splitting its test files or adding shards does not
+remove that package tax.
 
 The suite also contains confidence gaps that must be fixed before broad tests
-are removed. The real `BdStore` conformance test is unconditionally skipped,
-the Native Dolt conformance export is MemStore-backed, `fsys.Fake` has no OSFS
-contract and differs from OS semantics, and the mail fake contradicts the
-documented archive contract. Fast false confidence is not the objective.
+are removed. The real `BdStore` conformance test is unconditionally skipped.
+The NativeDoltStore adapter contract uses an in-process `beadslib.Storage`
+fixture and is correctly separate from the real-Dolt boundary proof, but its
+name should state that distinction. `fsys.Fake` has no OSFS contract and
+differs from OS semantics, and the mail fake contradicts the documented
+archive contract. Fast false confidence is not the objective.
 
 The target is a resource-aware test architecture built around one rule:
 
@@ -37,13 +40,15 @@ deterministic, and parallel-safe. Production adapters and their doubles share
 the same executable contracts. Coordination tests prove only wiring and order.
 A small portfolio of journeys proves that the major boundaries compose.
 
-Open PR [#4193](https://github.com/gastownhall/gascity/pull/4193) demonstrates
-that the immediate latency objective is attainable: Actions run
-[29209948175](https://github.com/gastownhall/gascity/actions/runs/29209948175)
-completed green in 4m31s after removing repeated broad suites, using a hermetic
-provider executable, narrowing the external `bd` contract, and shortening CI
-fan-in. Phase 0 adopts those changes when the PR merges; the remaining phases
-make that sub-five-minute result durable by changing the test and production
+Merged PR [#4193](https://github.com/gastownhall/gascity/pull/4193) established
+the immediate latency baseline. Its exact-main Actions run
+[29220498625](https://github.com/gastownhall/gascity/actions/runs/29220498625)
+completed green in 4m59s workflow wall time, including queueing, and 4m15s from
+runner-policy start to `CI / required`. It removed repeated broad suites, used
+a hermetic provider executable, narrowed the external `bd` contract, shortened
+CI fan-in, and retained the real managed-Dolt hard-kill/port-rebind proof in an
+explicit path-owned integration manifest. Phase 0 preserves these changes; the
+remaining phases make the result durable by changing the test and production
 architecture beneath it.
 
 ## Goals
@@ -105,29 +110,28 @@ end of this document.
 
 | Measure | Current value | Interpretation |
 |---|---:|---|
-| Go test files | 1,543 | Breadth is high; navigation and ownership matter. |
-| Top-level `Test` functions | 18,189 | Plus 9 benchmarks and 1 fuzz target. |
-| Test Go LOC | 733,537 | 63.2% of all Go LOC. |
-| Production Go LOC | 427,497 | Test:production ratio is 1.72:1. |
-| Untagged/default test files | 1,407 | Resource-heavy work is not reliably separated by tags. |
-| Untagged/default test LOC | 685,431 | 93.4% of test LOC enters the default package shape. |
-| `t.Run` calls | 2,131 | Table/subtest use is modest relative to test count. |
+| Go test files | 1,548 | Breadth is high; navigation and ownership matter. |
+| Test-prefixed functions | 18,222 | 18,210 runnable tests plus 12 `TestMain` entrypoints; also 9 benchmarks and 1 fuzz target. |
+| Test Go LOC | 735,025 | 63.2% of all Go LOC. |
+| Production Go LOC | 428,004 | Test:production ratio is 1.72:1. |
+| Untagged/default files, functions, LOC | 1,411 / 17,581 / 686,767 | 93.4% of test LOC enters the default package shape. |
+| `t.Run` calls | 2,132 | Table/subtest use is modest relative to test count. |
 | `t.Parallel` call sites | 780 in 65 files | Sparse usage is consistent with global-state constraints; nested calls mean this is not a percentage of top-level tests. |
-| `t.Setenv` calls | 5,052 | 3,957 are under `cmd/gc`. |
-| `t.TempDir` calls | 8,673 | Good isolation habit, but many tests still mutate process globals. |
-| `time.Sleep` calls | 442 in 155 files | 293 calls are in untagged tests. |
-| `exec.Command*` calls | 493 in 134 files | 108 process-using files are untagged. |
-| Explicit `t.Skip*` calls | 534 | Skips need ownership and expiration where they suppress contracts. |
+| `t.Setenv` calls | 5,055 | 3,960 are under `cmd/gc`. |
+| `t.TempDir` calls | 8,677 | Good isolation habit, but many tests still mutate process globals. |
+| `time.Sleep` calls | 447 in 157 files | 295 calls across 114 files are in untagged tests. |
+| `exec.Command*` calls | 495 in 135 files | 380 calls across 98 files are in untagged tests. |
+| Explicit `t.Skip*` calls | 535 | Skips need ownership and expiration where they suppress contracts. |
 
 Build-tagged test files currently break down as follows:
 
-| Declared class | Files | Top-level tests | LOC | Current role |
+| Declared class | Files | Test-prefixed functions | LOC | Current role |
 |---|---:|---:|---:|---|
-| `integration` | 57 | 281 | 18,930 | Real processes/providers plus some seam conformance. |
-| `acceptance_a` | 36 | 108 | 6,777 | PR smoke, including external `bd` contracts. |
+| `integration` | 58 | 282 | 19,062 | Real processes/providers plus some seam conformance. |
+| `acceptance_a` | 35 | 105 | 5,941 | PR smoke; external `bd` contracts now have an exact dedicated manifest. |
 | `acceptance_b` | 3 | 10 | 996 | Nightly lifecycle/stability. |
 | `acceptance_c` | 24 | 139 | 15,252 | Live inference and tutorial-golden coverage. |
-| Other OS/native/live tags | 16 | 100 | 6,151 | Platform and special compatibility checks. |
+| Other compound/native/OS tags | 17 | 105 | 7,007 | Platform and special compatibility checks. |
 
 The tags describe invocation history more than resource consumption. Some
 untagged tests spawn processes or listeners, while some `integration` tests
@@ -136,31 +140,31 @@ to reason about from names alone.
 
 ### Concentration and compile tax
 
-| Direct package/directory | Test files | Top-level tests | Test LOC |
+| Direct package/directory | Test files | Test-prefixed functions | Test LOC |
 |---|---:|---:|---:|
-| `cmd/gc` | 445 | 7,448 | 317,566 |
+| `cmd/gc` | 447 | 7,451 | 317,712 |
 | `internal/api` | 141 | 1,401 | 52,625 |
 | `internal/config` | 63 | 1,390 | 41,508 |
-| `internal/beads` | 51 | 668 | 30,872 |
+| `internal/beads` | 52 | 679 | 31,258 |
 | `internal/session` | 49 | 560 | 21,349 |
 | `internal/dispatch` | 13 | 315 | 20,054 |
-| `examples/gastown` | 10 | 244 | 16,351 |
+| `examples/gastown` | 10 | 244 | 16,395 |
 | `test/integration` | 44 | 162 | 15,350 |
 
 Largest files include:
 
-| File | LOC | Top-level tests |
+| File | LOC | Test-prefixed functions |
 |---|---:|---:|
-| `cmd/gc/beads_provider_lifecycle_test.go` | 11,849 | 211 |
+| `cmd/gc/beads_provider_lifecycle_test.go` | 11,882 | 211 |
 | `cmd/gc/build_desired_state_test.go` | 11,821 | 220 |
-| `examples/gastown/maintenance_scripts_test.go` | 10,906 | 154 |
+| `examples/gastown/maintenance_scripts_test.go` | 10,950 | 154 |
 | `cmd/gc/session_reconciler_test.go` | 10,881 | 215 |
 | `internal/dispatch/runtime_test.go` | 9,932 | 144 |
 | `cmd/gc/order_dispatch_test.go` | 9,579 | 196 |
 | `cmd/gc/cmd_sling_test.go` | 8,792 | 237 |
 | `internal/config/config_test.go` | 8,147 | 405 |
 
-Compile-only measurements make the structural cost visible. They were taken
+Pre-#4193 compile-only measurements make the structural cost visible. They were taken
 with Go 1.26.5 on Linux/amd64, an AMD EPYC 9654 host exposing 192 logical CPUs,
 the shared warm `/data/cache/go-build`, and no cache clean. The host had
 concurrent fleet load, so these values are evidence of package shape, not a
@@ -178,15 +182,15 @@ production logic and its tests must leave the package.
 ### Process, global-state, and synchronization signals
 
 - `skipSlowCmdGCTest` appears in 78 markers across 27 `cmd/gc` files: 77 gated
-  call sites plus the helper definition. Ninety-four other untagged
+  call sites plus the helper definition. Eighty-eight other untagged
   process-using files contain neither that gate nor a `testing.Short` guard.
-- `cmd/gc` contains only 113 `t.Parallel` call sites among 7,448 top-level
-  tests. Its `TestMain`, 3,957 `t.Setenv` calls, 98 direct `os.Chdir` calls,
+- `cmd/gc` contains only 113 `t.Parallel` call sites among 7,451 test-prefixed
+  functions. Its `TestMain`, 3,960 `t.Setenv` calls, 98 direct `os.Chdir` calls,
   mutable package hooks, tmux roots, and provider factories make
   indiscriminate parallelization unsafe.
-- Test code contains 331 `time.After` occurrences across 81 files and tmux
+- Test code contains 337 `time.After` occurrences across 83 files and tmux
   references in 172 test files.
-- Non-test Go outside `test/**` contains 644 `time.Now`, 95 `time.Sleep`, 51
+- Non-test Go outside `test/**` contains 653 `time.Now`, 93 `time.Sleep`, 54
   `time.After`, 49 `time.NewTicker`, and 44 `time.NewTimer` occurrences. The
   current `internal/clock.Clock` exposes only `Now`, so it cannot drive most
   lifecycle or scheduler tests.
@@ -212,10 +216,13 @@ Concrete authored wait floors include:
 - Workspace proxy readiness polls every 100 ms and shutdown every 50 ms;
   tests duplicate deadline/sleep loops around the same process lifecycle.
 
-### Open PR #4193 latency evidence
+### Merged PR #4193 latency evidence
 
-The optimized open-PR run completed in 271 seconds end to end. Its longest
-observed jobs were:
+The original optimized run completed in 271 seconds end to end. The final
+exact-main run completed in 299 seconds including queueing and 255 seconds from
+runner-policy start to `CI / required`. Its longest test job was Docker at 224
+seconds; the retained managed-Dolt integration manifest completed in 181
+seconds. The original run's lane measurements were:
 
 | Lane | Duration |
 |---|---:|
@@ -245,8 +252,13 @@ therefore needs a p95 and variance budget, not merely one p50 success.
 - Typed OpenAPI, generated clients, event payload registration, and dashboard
   projection tests catch important cross-layer drift.
 - Acceptance tiers separate unauthenticated smoke from live inference.
-- Open PR #4193 demonstrates how to eliminate obvious repeated work without
+- Merged PR #4193 demonstrates how to eliminate obvious repeated work without
   dropping the external `bd` or macOS compatibility promises.
+- Merged PR #4197 adds an injected reopen callback that re-resolves the managed
+  Dolt endpoint, one wall-clock retry context, single-flight reconnect,
+  terminal close semantics, close-versus-reconnect protection, focused
+  transient/error/budget/concurrency tests, production wiring guards, and a
+  tagged real hard-kill/port-rebind contract.
 
 The plan builds on those assets; it does not replace them.
 
@@ -286,9 +298,9 @@ The most important gaps are:
 - Real `BdStore` conformance is unconditionally skipped by a stale June-era
   guard even though the default pin moved to `bd` v1.1.0 in
   [PR #4007](https://github.com/gastownhall/gascity/pull/4007). Only the
-  minimum-supported compatibility cell remains on v1.0.4. The Native Dolt
-  conformance helper delegates to an in-memory storage fixture, so its name
-  overstates the boundary proved.
+  minimum-supported compatibility cell remains on v1.0.4. The NativeDoltStore
+  adapter contract uses an in-process `beadslib.Storage` fixture; that is a
+  valid adapter proof, but its name must distinguish it from live Dolt.
 - `fsys.Fake` has no shared OSFS/Fake contract and differs on parent existence,
   file/directory collisions, symlink replacement, missing-directory reads,
   directory rename/remove semantics, and symlink chmod.
@@ -302,6 +314,14 @@ The most important gaps are:
   applicable contract.
 - The test called K8s session conformance exercises a generic exec script
   provider rather than `internal/runtime/k8s.Provider`.
+
+The current entrypoint census is six store paths (Mem, File, NativeDoltStore
+with in-process storage, exec-script, skipped real BdStore, and `br`
+integration), nine runtime entries including raw/seam duplicates, five mail
+entries including Fake and MCP, and three events entries. This is an inventory
+of entrypoints, not proof that every production constructor is covered; the
+checked ledger in P0.3 must name exact constructors, applicable contracts, and
+skips.
 
 Honesty fixes precede broad test deletion.
 
@@ -346,20 +366,45 @@ cross-boundary risk, a runtime budget, and a lane. If two journeys own the same
 promise, consolidate them. Edge cases move down; provider matrices move to
 targeted/nightly lanes.
 
+### 7. Some guardrails preserve implementation coupling and duplicated policy
+
+`scripts/check-routed-test-rows.sh`, wired into `make check`, requires every
+migrated `cmd/gc/cmd_*_test.go` containing one routed-read marker to contain all
+six markers: API success, cache-not-live, generic 500, 404, controller-down,
+and escape hatch. Ten command test files currently carry that matrix, and
+several repeat it for multiple list/show operations. The guard prevents
+missing rows by institutionalizing duplicated route-policy tests in every
+adapter. The six route decisions need one owner below the commands; each
+command should prove only its endpoint translation, fallback wiring, and
+unique user-facing result.
+
+Architecture migration guards also use raw source substrings and line scans.
+For example, the worker-boundary guard can miss aliased or renamed calls and
+match comments, while the beads exec guard can miss indirect or multiline
+construction. These are useful migration intentions implemented as lexical
+heuristics. Architecture rules should inspect Go syntax and, where identity
+matters, types; they must ignore comments/string fixtures, handle aliases and
+multiline calls, and remain separate from behavioral correctness proofs.
+
 ## Guideline drift to correct
 
 | Current statement or pattern | Evidence of drift | Required correction |
 |---|---|---|
 | “Three tiers” | The document defines more than three overlapping purposes. | Separate purpose from resource size. |
-| Unit tests receive dependencies directly and do not use env vars. | 5,052 `t.Setenv` calls; 3,957 in `cmd/gc`. | Ban new env-controlled small tests; migrate through injected `Env`/config. |
+| Unit tests receive dependencies directly and do not use env vars. | 5,055 `t.Setenv` calls; 3,960 in `cmd/gc`. | Ban new env-controlled small tests; migrate through injected `Env`/config. |
+| Unit tests use testify `require`/`assert`. | Only 6 of 1,548 test files import testify; the suite overwhelmingly uses the standard library. | Remove the fictional mandate or adopt it through a deliberate, separately justified convention change; do not churn tests mechanically. |
+| Tests use the implementation package to access unexported symbols. | 130 external-package test files already provide useful black-box contracts; blanket same-package testing couples tests to private structure. | Use external packages for public/adapter contracts and same-package tests only when a private invariant is the actual subject. |
 | Integration tests are not in CI by default. | PR, macOS, nightly, and RC workflows run extensive integration matrices. | Document exact lane placement and path triggers. |
 | “The four test doubles” | The table lists three. Other exported fakes also exist. | Replace the inventory prose with a generated/checked conformance ledger. |
 | Every fake has a compile-time interface assertion. | `fsys.Fake` has no visible assertion and no shared behavior contract. | Require both compile-time satisfaction and executable conformance. |
-| Every provider implementation runs conformance. | Real BdStore is skipped; Native Dolt is memory-backed; runtime coverage is duplicated and incomplete. | Test production constructor paths; govern and expire skips. |
+| Every provider implementation runs conformance. | Real BdStore is skipped; NativeDoltStore's adapter contract uses in-process `beadslib.Storage`; runtime coverage is duplicated and incomplete. | Name adapter and real-Dolt proofs separately; test production constructor paths; govern and expire skips. |
 | Every command follows `cmdFoo`/`doFoo`. | The giant package and global factories show that dependency ownership remains ambient. | Prefer constructor-injected command gateways and extracted use cases. |
 | Timer races need at least a 10s deadline. | Sensible ceilings coexist with fixed sleeps and blocking doubles that wait 3-10s. | Keep generous deadlines; forbid using them as authored wait time. |
 | No mock libraries. | Mega-fakes and one-off embedded stores provide mock-like interaction coupling. | Judge doubles by contract and responsibility, not library origin. |
 | Testscript tests user behavior. | Thirty-two stable subtests sit under one top-level parent that the current sharder cannot split; two parents rerun subsets. | Make existing subtests selectable/timed by the shard layer and give each one owner. |
+| Every routed-read command repeats the six-row matrix. | `check-routed-test-rows.sh` requires all six markers in each of 10 command files; some files carry multiple matrices. | Extract a typed route-selection policy, test its six outcomes once, and leave adapter-specific mapping/composition proofs in each command. |
+| Architecture boundaries are guarded with source substrings. | Lexical scans can match comments/fixtures and miss aliases, multiline calls, renamed receivers, or indirect construction. | Use scoped AST/type-aware analyzers with negative fixtures; source guards prove dependency shape, never runtime behavior. |
+| Pack checks retry whole commands up to three times. | An assertion or deterministic product failure can be rerun instead of classified, obscuring first-attempt reliability. | Retry only explicitly classified network operations, retain the first failure as evidence, and never retry assertions or whole test commands to green. |
 
 ## Target test architecture
 
@@ -393,8 +438,11 @@ mechanical precedence rule:
 1. The canonical identity is package plus top-level test name; subtests inherit
    the top-level test's size. If any subtest needs a larger resource, the whole
    top-level test has that larger size.
-2. An exact checked manifest entry declares Medium or Large. Package `TestMain`
-   setup raises every test in that package to at least the setup's size.
+2. An exact checked entry declares Medium or Large. A package-level entry may
+   declare inherited `TestMain` resources once; exact top-level overrides name
+   additional resources or a larger size. `TestMain` setup raises every test
+   in that package to at least the package default without requiring thousands
+   of duplicate rows.
 3. `integration` and acceptance build tags default to Large until an exact
    manifest entry truthfully classifies a hermetic Medium test.
 4. Every other untagged, unlisted test is Small. Existing violations live in a
@@ -491,14 +539,14 @@ Every reusable double must:
 
 | Seam | Production path(s) | Current double/support | Shared proof today | Gap and target decision |
 |---|---|---|---|---|
-| `beads.Store` | MemStore, FileStore, BdStore, NativeDoltStore, CachingStore, DoltLite read, exec, library store | MemStore plus many embedded one-off wrappers | `beadstest` with governed skip ledger | Split consumer capabilities; run applicable contracts. Restore one real BdStore smoke. Rename the memory-backed Native Dolt proof. Replace wrappers with recording/faulting/gated decorators. |
+| `beads.Store` | MemStore, FileStore, BdStore, NativeDoltStore, CachingStore, DoltLite read, exec, library store | MemStore plus many embedded one-off wrappers | `beadstest` with governed skip ledger | Split consumer capabilities; run applicable contracts. Restore one real BdStore smoke. Name the in-process `beadslib.Storage`-backed NativeDoltStore adapter conformance separately from live Dolt. Replace wrappers with recording/faulting/gated decorators. |
 | `runtime.Provider` | fake, subprocess, tmux, exec, ACP, herdr, K8s, SSH, T3 bridge, auto, hybrid | Broad mutable `runtime.Fake` | `runtimetest` | Run full applicable conformance once on each production constructor composition. Replace duplicate raw/seam suites with narrow forwarding proofs. Add an expiring skip ledger. |
 | `mail.Provider` | beadmail, exec, MCP | `mail.Fake` | `mailtest` | Expand archive/delete visibility across every read/reply/thread operation; repair Fake; inject ID/time. Retain backend contracts. |
 | `events.Provider` | FileRecorder, exec | `events.Fake` | provider, rotation, and concurrency contracts | Make Fake broadcast to all watchers without a timer. Run concurrency against exec or serialize in the adapter and specify it. Reuse file notifications for FileRecorder. |
 | Event aggregation | Multiplexer over registered providers | provider/test watchers | focused multiplexer tests | Define an aggregation contract for attach failure, cursor isolation, fan-in, close, and slow sources; do not claim Multiplexer implements `events.Provider`. |
 | `fsys.FS` and extensions | OSFS | mutable map-backed `fsys.Fake` | None | Add one OSFS/Fake contract for errors, parents, collision, links, rename, remove, modes, and atomic replacement. Repair Fake before further reliance. Keep recording/faults as decorators. |
 | Worker capabilities | SessionHandle, RuntimeHandle | scripted worker process; no general Handle double | telemetry and phase-specific tests | Define narrow lifecycle, messaging, observation, and history contracts. Do not create one enormous Handle contract. Preserve explicit unsupported capabilities. |
-| Session use cases | Manager over broad store/runtime seams | repeated MemStore + runtime Fake; `sessiontest` builder | state-specific suites | Make `sessiontest` the tested builder and migrate raw bead fixtures under the existing migration plan. Narrow ports by consuming use case. |
+| Session use cases | Manager over broad store/runtime seams | conformant `sessiontest` builder plus runtime Fake | state-specific suites and permanent-zero migration guard | Retain #4158's completed fixture cutover; narrow ports by consuming use case without reopening codec-fixture migration. |
 | API handler state | controller state and generated client | 538 exact constructor/literal syntax occurrences for broad `fakeState` | schema/OpenAPI checks | Introduce handler-owned gateways by vertical slice. Use tiny value fakes. Retain one typed live server/client contract. |
 | Workspace process lifecycle | OS process groups, proxy, readiness | local test runtime/instance | None | Extract `ProcessSupervisor`, `Process.Done`, and `ReadinessProbe`; conformance-test a scripted process and retain one real-process proof. |
 | Maintenance scheduling | timer loop, SQL Dolt ops, backup exec | local runners | partial | Use `testing/synctest` or a narrow Scheduler for cycle behavior; add adapter contracts for the real/scripted operations. |
@@ -559,13 +607,21 @@ hermetic providers unless the external provider is the boundary under test.
 | ID | System promise | Unique boundary risk | Budget |
 |---|---|---|---:|
 | J1 | Pack bootstrap -> city initialization/start -> configured session ready -> clean stop | Pack/config materialization, controller startup, runtime construction, durable lifecycle, orphan cleanup | 60s |
-| J2 | Bead creation -> formula v2 graph fan-out/dependency gate -> completion and convoy drain | Durable work, graph dispatch, concurrency, dependency gating, finalization | 90s |
+| J2 | Rig-scoped source bead in the rig store -> formula v2 materialization -> city-scoped orchestrator/control-dispatcher readiness -> scoped `gc bd` reads and writes -> cross-store fan-out/dependency gates -> completion and convoy drain | Different store tiers and ID prefixes; rig-store roots/dependencies; city-store worker/control state; store-aware readiness/dispatch | 90s |
 | J3 | Worker exits during an attempt -> persistent retry/recovery -> one durable terminal state with no duplicate active assignment or finalization | Session loss, persistent state, retry ownership, idempotent convergence; this does not promise exactly-once execution or external effects | 90s |
 | J4 | Typed HTTP `202` mutation -> correlated SSE result -> durable typed API read | Huma routing, async request correlation, event stream, storage, and generated Go wire types | 90s |
 
 Each journey must declare its fixture, resource ownership, last-progress
 diagnostic, and cleanup assertions. No journey may enumerate low-level error
 branches already owned below.
+
+J2 must fail if dispatch readiness looks only in the city store or a worker
+resolves the rig root through ambient/default store state. It asserts durable
+terminal state in both stores and exercises a rig-scoped source/root with
+city-scoped orchestrator, worker, and control beads. The direct static owner
+for shipped prompts/scripts using `gc bd`, never ambient raw `bd`, is
+`internal/bootstrap/packs/core/pack_assets_test.go` plus pack-specific asset
+contracts; J2 proves only that the scoped command composes correctly.
 
 ### Provider and compatibility proofs
 
@@ -575,22 +631,29 @@ and run when their boundary changes, plus on nightly/RC:
 | Boundary proof | PR placement | Broader placement |
 |---|---|---|
 | Real BdStore/DoltLite read-write-dependency and restart smoke | Path-targeted, exact manifest | Nightly/RC full contract and recovery |
+| Managed Dolt hard-kill/port-rebind through production NativeDoltStore reopen wiring | Managed-Dolt path-targeted exact manifest | Nightly/RC broader recovery matrix |
 | Four external `bd` CLI compatibility tests against previous/current/HEAD | Path-targeted focused cells | RC compatibility matrix |
 | One real tmux start/nudge/stop/orphan-cleanup proof | Runtime-path targeted | Nightly platform matrix |
 | One subprocess/exec protocol lifecycle proof | Runtime-path targeted | Nightly provider canaries |
-| Hermetic T3 bridge visible-thread/start-resume-stop composition | T3 bridge-path targeted | Cross-repository/live T3 proof on nightly/RC |
+| Gas City -> T3Bridge -> T3 Code using DoltLite-backed scoped bead/session state | Path-targeted protocol/identity/state contract against pinned T3 fixture | Real visible-thread/start/resume/stop composition on nightly/RC |
 | Dashboard seeded projection and one browser interaction smoke | Dashboard-path targeted | Broader browser suite on push/RC |
 | Live provider auth/inference | Never generic PR | Nightly/explicit profile matrix |
 | Docker/K8s lifecycle | Path-targeted smoke if changed | Nightly/RC platform suite |
-| Chaos, SIGKILL, rotation, and exhaustive recovery matrices | No | Nightly/RC |
+| Remaining chaos, rotation, and exhaustive recovery matrices | No | Nightly/RC |
+
+The hermetic T3Bridge/DoltLite proof requires exact start/resume/stop protocol,
+stable session identity, durable scoped state, clean stop, and no leaked
+runtime resources. It runs when any owned boundary changes. Only the live
+cross-repository nightly/RC proof claims visible thread and UI/runtime
+composition.
 
 ### Retain, move, consolidate, delete
 
 | Decision | Coverage |
 |---|---|
 | Retain on every PR | All small unit/use-case tests; hermetic contracts; OpenAPI/generated/event registries; the four journeys; relevant focused compatibility cells |
-| Retain path-targeted | Real OS/process/provider contracts, dashboard/browser smoke, Docker/K8s, real tmux, real BdStore |
-| Move to push/nightly/RC | Broad REST read sweeps, full provider matrices, chaos/recovery, live inference, exhaustive tutorial permutations, full formula retry matrices |
+| Retain path-targeted | Real OS/process/provider contracts, managed-Dolt hard-kill/rebind, dashboard/browser smoke, Docker/K8s, real tmux, real BdStore |
+| Move to push/nightly/RC | Broad REST read sweeps, full provider matrices, broad chaos/recovery permutations, live inference, exhaustive tutorial permutations, full formula retry matrices |
 | Consolidate | Mail E2E families, event E2E families, lifecycle permutations, repeated `httptest.Server` setup, raw/seam runtime contracts |
 | Delete after replacement proof | One-off embedded MemStore fakes, interaction-only outcome duplicates, polling tests replaced by event/channel tests, catalog-only “conformance” tests |
 
@@ -615,10 +678,12 @@ samples use a named runner image/class recorded with the result, a warm Go
 object/module cache, test-result caching disabled with `-count=1`, and no source
 changes except the measured package. The focused form is
 `go test -count=1 -run '^TestName$' ./path`; the whole Small loop is
-`make test-fast-parallel` after the legacy size ledger reaches zero. Cold builds
-use an isolated temporary `GOCACHE` and are reported separately. Local hardware
-is useful for trends; the named Blacksmith runner cohort is the enforcement
-baseline.
+the P0.4 manifest-filtered mode (exposed as `make test-small-parallel` or an
+equivalent checked target). The existing `make test-fast-parallel` is not a
+Small-only target because package `TestMain` resources and intentional Medium
+tests still participate. Cold builds use an isolated temporary `GOCACHE` and
+are reported separately. Local hardware is useful for trends; the named
+Blacksmith runner cohort is the enforcement baseline.
 
 ### PR and release
 
@@ -668,17 +733,18 @@ from first-attempt test-system reliability.
   are made instance-owned. `t.Parallel` count is not itself a quality metric.
 - Every large test is present in the checked E2E/provider manifest with owner,
   promise, resources, budget, lane, and last measured p50/p95.
-- Reclassification cannot cure debt. Program completion requires zero
-  `skipSlowCmdGCTest` markers, zero direct `os.Chdir` in `cmd/gc` tests, zero
-  broad API `fakeState` constructions, zero untagged process-resource debt,
-  fewer than 500 `cmd/gc` `t.Setenv` calls reserved for actual CLI/env
-  contracts, and fewer than 50 repository test sleeps, all in ledgered Large
-  external-boundary tests.
+- Reclassification cannot cure debt. Freeze the initial ledgers at 78
+  `skipSlowCmdGCTest` markers, 98 direct `os.Chdir` calls in `cmd/gc` tests, 538
+  broad API `fakeState` constructions, 98 untagged process-using files, 3,960
+  `cmd/gc` `t.Setenv` calls, and 447 repository test sleeps. Changed code may
+  not grow its applicable category. Every extraction maps the moved invariants
+  and reports category counts plus package runtime before and after. Approve
+  burn-down milestones by owned invariant and measured impact; do not game
+  ungrounded global terminal counts.
 
 ## CI placement and protection
 
-When merged, PR #4193's immediate reductions become the baseline, not optional
-cleanup:
+Merged PR #4193's immediate reductions are the baseline, not optional cleanup:
 
 - Tier A uses a hermetic idle provider executable and does not require host
   inference/auth.
@@ -720,8 +786,7 @@ ledger, then repeat. Their first schedulable slices and terminal censuses are:
 
 | Program | First bead-sized slice | Terminal census |
 |---|---|---|
-| H5 runtime contracts | Adopt PR #4193's production-path tmux/subprocess deduplication, then handle one remaining constructor family per bead | Every production constructor has applicable contract/ledger rows; raw/seam duplicate full runs = 0 |
-| D3 session fixtures | Migrate the first <=5-file batch already enumerated by the linked session plan | Raw fixture sites = 0 except documented edge oracles |
+| H5 runtime contracts | Retain PR #4193's production-path tmux/subprocess deduplication, then handle one remaining constructor family per bead | Every production constructor has applicable contract/ledger rows; raw/seam duplicate full runs = 0 |
 | D5 desired state | Extract the pure fair-share/create-budget policy cluster and its tests before store/runtime effects | All desired-state policy branches live outside `cmd/gc`; command retains translation/coordination only |
 | D6 provider lifecycle | Extract ensure-ready -> init -> hook ordering and rollback through a narrow lifecycle port | Lifecycle branch matrix lives in the service; `cmd/gc` owns construction/presentation only |
 | E3 integration split | Move the typed API live-contract family into a resource-specific package with its own minimal setup | No test pays a `TestMain` resource it does not use; old 162-test package is dissolved or journey-only |
@@ -731,9 +796,10 @@ ledger, then repeat. Their first schedulable slices and terminal censuses are:
 
 #### P0.1 — Retain the focused PR topology
 
-**Change:** Merge or otherwise adopt PR #4193's exact external `bd` manifest,
-hermetic provider double, production-path tmux conformance, push-only full REST
-coverage, and parallel fan-in as the starting topology.
+**Change:** Retain merged PR #4193's exact external `bd` manifest, hermetic
+provider double, production-path tmux conformance, push-only full REST
+coverage, path-owned managed-Dolt rebind proof, and parallel fan-in as the
+starting topology.
 
 **Acceptance:**
 
@@ -745,8 +811,8 @@ coverage, and parallel fan-in as the starting topology.
 **Verification:** Actions timings and the workflow policy tests introduced by
 that PR.
 
-**Dependencies:** PR #4193 must merge or its changes must be ported. **Estimate:**
-implemented on the open PR branch; monitor after adoption.
+**Dependencies:** None; PR #4193 is merged. **Estimate:** implemented; monitor
+the rolling full-union runtime and prevent coverage/topology regression.
 
 #### P0.2 — Consume the two-minute design's timing milestone
 
@@ -767,8 +833,13 @@ or shard planner.
 **Verification:** the linked design's script/policy tests plus a dry-run
 planner fixture with cold, warm, missing, and outlier samples.
 
-**Dependencies:** P0.1 and the linked design's timing/planner tasks.
-**Estimate:** owned by that design.
+**Owner/status:** `ga-80po0c`; blocked. The linked design names `ga-nakct`,
+which is not present in the current Gas City store. Create and assign a live
+timing/planner child bead under the implementation epic and record it in both
+documents before scheduling this task.
+
+**Dependencies:** P0.1 and an assigned timing/planner child bead.
+**Estimate:** owned by the linked design after ownership repair.
 
 #### P0.3 — Establish a checked architecture ledger
 
@@ -796,7 +867,30 @@ contract cases.
 
 **Dependencies:** None. **Estimate:** medium.
 
-#### P0.4 — Establish an automated race-detector cadence
+#### P0.4 — Establish the size/resource debt ledger
+
+**Change:** Add a checked Medium-test manifest and a baseline ledger for
+untagged tests that violate the Small contract through subprocesses, listeners,
+tmux, Dolt, fixed sleep, env/cwd mutation, or shared host resources. Record the
+owning invariant, intended size, resource owner, migration target, and expiry.
+E1 remains the sole owner of Large journey/provider entries.
+
+**Acceptance:** Every Medium test inherits a checked package default or has an
+exact top-level owner and resource list. `cmd/gc` records its `TestMain` cost in
+one package row, not 7,450 copies; exact overrides name additional resources.
+Every known untagged Small violation is ledgered; new or growing debt fails a
+focused check; reclassification requires evidence rather than a label-only
+edit. The initial counts match this audit's baselines.
+
+**Likely slice:** One machine-readable ledger, resource-census checker,
+positive/negative fixtures, and `TESTING.md` generated/checked tables.
+
+**Verification:** Exact-manifest dry run plus fixtures for an unlisted process,
+env mutation, fixed sleep, expired entry, and valid Medium owner.
+
+**Dependencies:** The size/purpose taxonomy in this plan. **Estimate:** medium.
+
+#### P0.5 — Establish an automated race-detector cadence
 
 **Change:** Add independent path-targeted, planner-sharded PR work that runs
 `go test -race` for changed concurrency-owning packages and their shared
@@ -806,10 +900,14 @@ across race-capable Go packages. PR race work runs in parallel with other
 required work and does not serialize the sub-five-minute graph.
 
 **Acceptance:** Events, runtime, session, worker, dispatch, workspacesvc, and
-new gated/broadcast doubles enter the required changed-package race lane;
-nightly reports the broad package census; unsupported process/provider cases
-are explicit; race failures never auto-retry to green. A full-union selection
-of all listed concurrency packages stays within the shard/gate budgets.
+new gated/broadcast doubles enter the required changed-package race lane.
+`cmd/gc` ledgers exact race-capable controller, reconciler, and provider-
+lifecycle test families rather than forcing its entire 4.1 GB package shape
+through every race PR; D5/D6/E6 migrate those families into extracted packages
+and the normal path-targeted lane. Nightly reports the broad package census;
+unsupported process/provider cases are explicit; race failures never
+auto-retry to green. A full-union selection stays within the shard/gate
+budgets.
 
 **Likely slice:** existing Go shard runner flag support, checked package/path
 manifest, PR/nightly workflow rows, policy tests.
@@ -820,6 +918,26 @@ packages; measured full-union race shards/gate meet the 90s/2m30s budgets on
 the reference runner.
 
 **Dependencies:** P0.2 timing output. **Estimate:** medium.
+
+#### E1 — Make the E2E/provider manifest executable
+
+**Change:** Encode J1-J4 and provider proofs with owner, system promise,
+resources, budget, lane, path triggers, diagnostics, and exact top-level tests.
+Have policy tests reject unlisted large tests, duplicate ownership, empty
+manifests, and stale test names.
+
+**Acceptance:** Every large test maps to one promise and exactly one cadence
+owner; each generic PR promise has exactly one PR-blocking owner, while
+nightly-only promises may have zero PR rows. Adding an E2E requires stating why
+lower layers cannot prove it and what it replaces or complements.
+
+**Likely slice:** Manifest, policy test, shard resolver, `TESTING.md`, and CI
+suite-coverage policy.
+
+**Verification:** Positive and negative policy fixtures; dry-run lists exactly
+the intended tests.
+
+**Dependencies:** P0.3 and P0.4. **Estimate:** medium.
 
 ### Phase 1: Restore contract honesty
 
@@ -875,23 +993,28 @@ beadmail and exec contract entrypoints.
 
 #### H3 — Restore a truthful real beads boundary
 
-**Change:** Remove the stale unconditional skip and run `RunStoreTests`,
-`RunMetadataTests`, and `RunDepTests` against real BdStore on the default `bd`
-v1.1.0 pin. Add a separate close/reconstruct-the-same-workspace durable-reopen
-proof because the current shared suites do not own that lifecycle. Keep v1.0.4
+**Change:** Remove the stale unconditional skip and make `RunStoreTests`,
+`RunMetadataTests`, and `RunDepTests` executable against real BdStore on the
+default `bd` v1.1.0 pin. Keep the exhaustive suites on nightly/RC. Define one
+path-targeted PR smoke for representative read, write, dependency, and
+close/reconstruct-the-same-workspace durability. Keep the v1.0.4
 minimum-supported cell focused on its declared external compatibility surface;
 any version-specific unsupported behavior needs a governed, explicit skip.
-Rename the MemStore-backed Native Dolt entrypoint to state exactly what it
-proves.
+Rename the in-process `beadslib.Storage`-backed NativeDoltStore adapter
+entrypoint to state exactly what it proves.
 
 **Acceptance:**
 
-- The required default-version BdStore job executes all three applicable shared
-  suites through BdStore -> `bd` CLI -> Dolt, and the separate reopen proof
-  verifies persistence across store reconstruction.
-- A zero-test or all-skipped manifest fails.
+- The path-targeted default-version BdStore PR job executes the exact smoke
+  manifest through BdStore -> `bd` CLI -> Dolt and verifies persistence across
+  store reconstruction within its declared budget.
+- Nightly/RC executes all three applicable shared suites. A zero-test or
+  all-skipped smoke or full manifest fails.
 - Native storage adapter conformance and live Dolt integration are named and
   reported separately.
+- #4197's fast injected-reopen tests and path-targeted real hard-kill/rebind
+  contract remain distinct required owners; broad recovery matrices may not
+  replace or silently absorb them.
 
 **Likely files:** `test/integration/bdstore_test.go`,
 `internal/beads/export_test.go`,
@@ -935,7 +1058,7 @@ tmux/subprocess executions, and add a governed runtime skip ledger.
 **Acceptance:**
 
 - Production tmux and subprocess compositions each run full conformance once.
-- Exec, ACP, K8s, SSH, T3 bridge, auto, hybrid, and herdr declare and run every
+- Exec, ACP, SSH, T3 bridge, auto, hybrid, and herdr declare and run every
   applicable capability contract or an owned expiring skip.
 - Raw adapter tests do not fork real infrastructure to re-prove the same state
   machine.
@@ -948,27 +1071,99 @@ run once in their targeted lane.
 
 **Dependencies:** P0.3. **Estimate:** large, split by provider family.
 
-#### H6 — Correct mislabeled K8s and Worker conformance
+#### H6 — Correct mislabeled K8s conformance
 
 **Change:** Make the K8s integration proof instantiate the actual K8s provider,
-or rename it as an exec protocol proof. Convert Worker phase-3 catalog entries
-into executable narrow capability contracts, or stop calling the catalog
-conformance until they are executable.
+or rename it as an exec protocol proof. Treat this as the K8s provider-family
+slice of H5 rather than requiring H5 to claim K8s coverage first.
 
 **Acceptance:** Test names, reports, and docs state the exact production path
-exercised; unsupported Worker capabilities fail explicitly and supported ones
-run against both handle implementations.
+exercised; the real-provider proof declares its supported capability contract
+or an owned expiring skip.
 
 **Likely files:** `test/integration/session_k8s_test.go`,
-`internal/runtime/k8s/provider_test.go`, and bounded files under
-`internal/worker/workertest`.
+`internal/runtime/k8s/provider_test.go`, and the runtime ledger.
 
-**Verification:** `make test-k8s` for the real boundary and focused Worker
+**Verification:** `make test-k8s` for the real boundary and focused K8s
 capability contracts.
 
-**Dependencies:** H5 for the runtime ledger. **Estimate:** medium.
+**Dependencies:** P0.3 runtime ledger; contributes one family to H5.
+**Estimate:** small-medium.
+
+#### H7 — Make Worker capability catalogs executable
+
+**Change:** Convert Worker phase-3 catalog entries into executable narrow
+capability contracts, or stop calling the catalog conformance until they are
+executable.
+
+**Acceptance:** Unsupported Worker capabilities fail explicitly; supported
+ones run against both handle implementations; catalog-only rows cannot satisfy
+the checked conformance ledger.
+
+**Likely slice:** Bounded files under `internal/worker/workertest` plus one
+handle implementation at a time.
+
+**Verification:** Focused Worker capability contracts under `-race` and a
+negative ledger fixture for a catalog-only claim.
+
+**Dependencies:** P0.3 architecture ledger. **Estimate:** medium, split by
+capability family.
 
 ### Phase 2: Build narrow use cases and canonical fast doubles
+
+#### D8 — Extract routed-read policy and retire the per-command six-row matrix
+
+**Change:** Extract API-versus-fallback selection into a small consumer-owned
+CLI routing package. Model API success, cache-not-live, generic server failure,
+not-found, controller absence, and explicit bypass as typed inputs and
+decisions. Test that policy table once. Keep only command-specific tests for
+request construction, response decoding, fallback invocation, exit/output
+mapping, and one composition proof per distinct adapter shape. Delete
+`scripts/check-routed-test-rows.sh` when the shared contract owns the policy.
+
+**Acceptance:** One shared table owns all six route decisions; no command test
+restates the shared branch matrix; every command still proves its unique API
+and fallback translation; route errors are typed rather than classified by
+message text; the old marker guard and duplicated helpers are gone; focused
+routing-package tests complete in <=5s.
+
+**Likely slice:** Shared route policy package and tests, one command migration,
+and its old matrix/helper deletion, followed by bounded slices for the
+remaining command families. Remove the Make target only with the final
+migration.
+
+**Verification:** Shared policy tests, focused command adapter tests, and a
+final exact census showing zero per-command six-row matrices with no lost
+endpoint/fallback contract.
+
+**Dependencies:** None; run early in Phase 2. **Estimate:** small first slice,
+medium migration program.
+
+#### D9 — Make split-store dispatch ownership explicit
+
+**Change:** Build on `internal/storeref` with a small consumer-owned store-set
+port for readiness and dispatch. The caller supplies the city coordination
+stores and the rig work store explicitly; point reads use ID-prefix ownership
+with hard-error preservation, while list/readiness queries declare which
+stores participate. Keep filesystem/config/provider construction in `cmd/gc`.
+
+**Acceptance:** MemStore-backed tests use distinct city and rig stores with
+`gcg-*` and `ga-*`-shaped IDs. A rig-rooted review/formula step becomes ready
+when its source/root dependency is in the rig store and its control state is
+in the city store; it remains blocked on a real missing dependency or hard
+store error. No dispatch path silently substitutes a default store, and no
+domain package opens a provider or derives scope from cwd/environment.
+
+**Likely slice:** `internal/storeref`, the readiness/dispatch consumer under
+`internal/dispatch` or `internal/convoy`, focused split-store tests, and the
+`cmd/gc` composition adapter. Migrate one read/list path at a time.
+
+**Verification:** Small split-store contract tests under `-race -count=20`,
+the J2 hermetic journey, and the path-owned real store composition proof.
+
+**Dependencies:** None for the in-memory split-store use-case slice. H3 gates
+the path-owned real-store composition proof. **Estimate:** medium, vertical
+slices.
 
 #### D1 — Split state, recording, fault, and gate behavior for stores
 
@@ -1005,24 +1200,6 @@ two caller files per wave.
 **Verification:** focused runtime/session packages under race and repetition.
 
 **Dependencies:** H5. **Estimate:** medium-large, incremental.
-
-#### D3 — Complete the `sessiontest` fixture migration
-
-**Change:** Execute the existing
-[session test-double migration plan](../plans/store-domain-objects/test-double-migration-plan.md): replace raw session-bead codec fixtures with
-the real `sessiontest` builder backed by conformant MemStore behavior.
-
-**Acceptance:** The ~498 inventoried raw fixture sites are migrated or retained
-with an explicit edge-oracle reason; the builder itself is contract-tested;
-session tests stop depending on storage encoding that is not their subject.
-
-**Likely slice:** no more than five caller files per wave plus the shared
-builder only when a real capability is missing.
-
-**Verification:** targeted packages, fixture census, and the plan's red-team
-checks.
-
-**Dependencies:** D1. **Estimate:** large, highly parallelizable waves.
 
 #### D4 — Replace API `fakeState` one handler family at a time
 
@@ -1080,7 +1257,7 @@ cohesive service with narrow lifecycle ports. Keep command parsing and provider
 construction in `cmd/gc`; retain one coordination proof for ordering.
 
 **Acceptance:** Failure/rollback branches no longer require env-selected exec
-spies; exact process argument construction stays in adapter tests; the 11,849
+spies; exact process argument construction stays in adapter tests; the 11,882
 line lifecycle test file shrinks as behavior moves to the owning package.
 
 **Likely slice:** lifecycle service and tests,
@@ -1194,11 +1371,15 @@ authenticated lane; no bare default tmux cleanup.
 #### W5 — Use structured Worker and Dolt lifecycle publications
 
 **Change:** Consume, do not duplicate, the structured Worker operation events
-from [Worker API hardening Task 4](worker-api-hardening-plan.md#task-4-add-structured-worker-operation-events-and-reduce-polling)
-and the managed Dolt publication/broker from
+that landed in `c86f102bc`; the linked
+[Worker API hardening Task 4](worker-api-hardening-plan.md#task-4-add-structured-worker-operation-events-and-reduce-polling)
+has stale Pending prose and is not an implementation dependency. Consume the
+managed Dolt publication/broker from
 [Dolt hardening Task 7](dolt-quality-hardening-plan.md#task-7-extract-managed-lifecycle-publication-and-ownership-from-gc-beads-bd)
 and [Task 8](dolt-quality-hardening-plan.md#task-8-introduce-a-dolt-state-brokercache-for-steady-state-consumers).
-Replace caller-local state polling only after those owning tasks land.
+Build on #4197's injected reopen seam, shared retry context, and terminal close
+semantics; do not create a second reconnect mechanism. Replace caller-local
+state polling only after those owning tasks land.
 
 **Acceptance:** Worker start/interrupt/message/history tests wait on structured
 operation outcomes; steady-state Dolt consumers wait on authoritative
@@ -1211,7 +1392,13 @@ stays in the linked plans.
 **Verification:** Worker/session/API regressions and Dolt lifecycle/recovery
 contracts under repetition.
 
-**Dependencies:** linked owning tasks. **Estimate:** medium per migration wave.
+**Owner/status:** `ga-80po0c`. Worker caller/test-wait migration is ready because
+its events are merged. The Dolt half is blocked: create and assign child beads
+for Dolt Tasks 7/8, then record those IDs and statuses in the owning plan and
+here. The prose links alone are not schedulable ownership.
+
+**Dependencies:** Worker half: none. Dolt half: linked owning tasks with
+assigned child beads. **Estimate:** medium per migration wave.
 
 #### W6 — Replace Docker command permutations with a protocol double
 
@@ -1234,25 +1421,6 @@ Docker smoke with resource-leak assertion.
 
 ### Phase 4: Rebuild E2E as a small requirements portfolio
 
-#### E1 — Make the E2E/provider manifest executable
-
-**Change:** Encode J1-J4 and provider proofs with owner, system promise,
-resources, budget, lane, path triggers, diagnostics, and exact top-level tests.
-Have policy tests reject unlisted large tests, duplicate ownership, empty
-manifests, and stale test names.
-
-**Acceptance:** Every large test maps to one promise; every promise has one PR
-owner; adding an E2E requires stating why lower layers cannot prove it and what
-it replaces or complements.
-
-**Likely slice:** manifest, policy test, shard resolver, `TESTING.md`, CI suite
-coverage policy.
-
-**Verification:** positive and negative policy fixtures; dry-run lists exactly
-the intended tests.
-
-**Dependencies:** P0.3. **Estimate:** medium.
-
 #### E2 — Land J1-J4 as the canonical PR journeys
 
 **Change:** Compose existing fixtures into the four named journeys; do not
@@ -1261,7 +1429,9 @@ asserts durable final state, and verifies cleanup.
 
 **Acceptance:** J1-J4 pass independently and concurrently within budgets;
 failures identify the last completed boundary; lower-level error permutations
-are absent.
+are absent. J2 fails when the dispatcher reads readiness only from the city
+store or a worker resolves the rig root through ambient/default state, and it
+asserts durable terminal state in both stores.
 
 **Likely slice:** one journey and its shared fixture per change, no more than
 five files.
@@ -1275,7 +1445,7 @@ an unrelated provider contract. **Estimate:** medium per journey.
 | Journey | Required predecessor slices |
 |---|---|
 | J1 | H5 contract for the production-selected hermetic runtime composition; W4 lifecycle readiness helper |
-| J2 | H3 default store truth; H4 event wake contract; D7 hermetic actor; existing formula/dispatch unit owners |
+| J2 | H3 default store truth; H4 event wake contract; D9 scoped-store resolver/dispatch contract; D7 hermetic actor; existing formula/dispatch unit owners |
 | J3 | D2 gated runtime behavior; D7 hermetic actor; Worker structured-operation slice from W5 |
 | J4 | H4 event concurrency/cursor behavior; W3 typed SSE request-result helper |
 
@@ -1334,13 +1504,14 @@ invariants appear in review evidence.
 
 **Dependencies:** H2, H4, E1-E2. **Estimate:** medium per family.
 
-#### E6 — Retire the all-7,448-tests process lane
+#### E6 — Retire the all-7,450-runnable-test process lane
 
 **Change:** Classify all 77 gated `skipSlowCmdGCTest` call sites represented by
-the 78-marker census. Move argument, retry, ordering, and failure cases to Small
-tests through injected ports. Move the few real boundary proofs into explicit
-process-contract packages/manifests. Delete the 12-way lane only when the
-marker census reaches zero, including removal of the helper.
+the 78-marker census. The package has 7,450 runnable tests plus one `TestMain`
+entrypoint that every shard pays. Move argument, retry, ordering, and failure
+cases to Small tests through injected ports. Move the few real boundary proofs
+into explicit process-contract packages/manifests. Delete the 12-way lane only
+when the marker census reaches zero, including removal of the helper.
 
 **Acceptance:** No test selection depends on running every `cmd/gc` test with
 `GC_FAST_UNIT=0`; each retained process proof names its boundary and budget;
@@ -1373,22 +1544,55 @@ policy tests.
 
 **Dependencies:** E1-E6. **Estimate:** medium.
 
+#### E8 — Land the T3Bridge + T3 Code + DoltLite composition proof
+
+**Change:** Add one bounded cross-repository provider proof for Gas City ->
+T3Bridge -> T3 Code using DoltLite-backed scoped bead/session state. The
+hermetic PR form owns a repo-pinned T3 fixture/runtime double; the live form
+runs against the compatible T3 Code checkout on nightly/RC. Do not put T3 or
+DoltLite assumptions into generic runtime/session packages.
+
+**Acceptance:** The path-targeted hermetic contract proves the exact
+start/resume/stop protocol, stable session identity, scoped durable state, and
+cleanup against the pinned T3 protocol fixture. The nightly/RC real-checkout
+proof additionally proves visible thread creation and UI/runtime composition.
+Path triggers cover Gas City T3Bridge, DoltLite composition, and the pinned T3
+contract. A version mismatch fails with both repository SHAs.
+
+**Likely slice:** T3Bridge provider fixture, cross-repo contract manifest, one
+Gas City integration entrypoint, and the T3 Code-side fixture/compatibility
+hook owned in that repository.
+
+**Verification:** Hermetic path-targeted proof on relevant PRs; live
+cross-repository proof on nightly/RC; exact-SHA diagnostics on failure.
+
+**Owner/status:** `ga-80po0c`; blocked until the T3 Code-side owner and pinned
+contract SHA are recorded as a child task.
+
+**Dependencies:** H5 T3Bridge runtime contract, D9 scoped-store ownership, and
+the T3 Code-side fixture owner. **Estimate:** medium cross-repository slice.
+
 ### Phase 5: Enforce the architecture and release discipline
 
 #### G1 — Add source and manifest guardrails
 
 **Change:** Extend the
 [two-minute design's isolation audit gate](../design/two-minute-ci-blacksmith.md#isolation-audit-gate)
-rather than creating a second scanner. Add this plan's ratchets for new fixed
-sleeps in Small tests, unlisted process/listener/tmux/Dolt resources,
-env/cwd-controlled Small tests, bare conformance skips, reusable exported fakes
-without contracts, and unlisted Large tests. Start with changed lines/files and
-an explicit legacy ledger; burn the ledger down rather than mass-suppressing
-findings.
+rather than creating a second scanner. New Go architecture rules use `go/ast`
+plus import/type identity where needed, preferably through focused
+`go/analysis` analyzers; do not add raw substring/line scans for dependency
+rules. Migrate existing lexical guards incrementally. Each rule declares its
+package/file scope, semantic violation, narrow owned exceptions, and whether
+it is a completeness proof or only a ratchet. Add this plan's size/resource
+ratchets in the same gate, starting with changed files and an explicit legacy
+ledger.
 
-**Acceptance:** New violations fail locally with a remediation message;
-existing debt has owner/count/baseline; false positives have reviewed narrow
-exceptions and expiry.
+**Acceptance:** Alias and multiline fixtures are detected; comments, string
+literals, testdata, and unrelated same-named methods do not trigger. Every
+rule has positive and negative fixtures; exceptions carry owner and expiry; a
+failure names the semantic boundary and remediation; changed-file analysis
+completes in <=5s locally. Architecture guards never substitute for behavioral
+or conformance tests. Existing debt has an owner/count/baseline.
 
 **Likely slice:** one check script or Go analyzer, tests/fixtures, Make target,
 pre-commit/CI wiring, legacy ledger.
@@ -1396,7 +1600,7 @@ pre-commit/CI wiring, legacy ledger.
 **Verification:** negative fixtures for every rule and a repo-wide baseline
 run.
 
-**Dependencies:** taxonomy and P0.3. **Estimate:** medium.
+**Dependencies:** taxonomy, P0.3, P0.4, and E1. **Estimate:** medium.
 
 #### G2 — Ratchet package compile and maintainability size
 
@@ -1455,8 +1659,14 @@ evidence.
 
 **Verification:** policy unit tests plus a non-publishing release dry run.
 
-**Dependencies:** P0.2 target met, E7, and the linked design's protected-check
-tasks. **Estimate:** shared milestone plus a small-medium release-policy slice.
+**Owner/status:** `ga-80po0c`; blocked. Create assigned child beads for the
+protected-check migration and exact-SHA release-policy slice, then record them
+in the linked design and here. The missing `ga-nakct` reference is not live
+ownership.
+
+**Dependencies:** P0.2 target met, E7, and assigned protected-check/release
+child beads. **Estimate:** shared milestone plus a small-medium release-policy
+slice.
 
 #### G5 — Add high-signal generative techniques at pure boundaries
 
@@ -1479,17 +1689,20 @@ scheduled fuzz/mutation jobs.
 
 ## Recommended execution order and parallelism
 
-Start four bounded workstreams after P0.1:
+With P0.1 merged, start four bounded workstreams:
 
 | Workstream | First tasks | Why first |
 |---|---|---|
 | Contract truth | H1, H2, H3, H4 | Prevents false confidence before consolidation. |
-| Architectural extraction | D4, then D5/D6 | Attacks the API and `cmd/gc` compile/global-state centers. |
+| Architectural extraction | D8 and D9, then D4 and D5/D6 | Removes duplicated route policy, makes split-store dispatch testable, then attacks the API and `cmd/gc` compile/global-state centers. |
 | Lifecycle signals | W1 and W3 | Replaces representative process and API polling with reusable patterns. |
-| Measurement/policy | P0.2, P0.3, E1 | Makes runtime, skip, and E2E ownership enforceable. |
+| Measurement/policy | P0.2-P0.5 and E1 | Makes runtime, size, race, skip, and E2E ownership enforceable. |
 
-H5 follows the runtime ledger, then D2. D1 follows the beads truth work, then
-D3. W4 follows the reusable request/process readiness helpers. E2 lands one
+Start D8 and D9 immediately as bounded high-ROI extractions; add D9's real-
+store composition proof after H3 truth is established. H5 follows the runtime
+ledger, then D2. D1
+follows the beads truth work. W4 follows the
+reusable request/process readiness helpers. E2 lands one
 journey at a time as its owning signals become available. E3/E5/E6 delete or
 move coverage only after those replacements pass. G1 starts in changed-line
 mode early and becomes a repo-wide ratchet at the end.
@@ -1500,7 +1713,7 @@ Recommended phase exit gates:
 |---|---|
 | 0 | Sub-five-minute topology retained; timing samples persist; provider/E2E ledger checked. |
 | 1 | OSFS/Fake and mail contracts agree; real beads smoke executes; events concurrency passes; production runtime contract inventory is truthful. |
-| 2 | Reusable decorators exist; first API and `cmd/gc` vertical slices leave the monolith; compile metrics improve; session fixture migration is underway. |
+| 2 | Reusable decorators exist; split-store readiness/dispatch is explicit; first API and `cmd/gc` vertical slices leave the monolith; compile metrics improve; #4158's session fixture cutover remains at its permanent-zero guard. |
 | 3 | Representative API, workspace, acceptance, Worker, and Dolt paths wake on signals; no fixed sleep remains in migrated small tests. |
 | 4 | J1-J4 are the only generic PR journeys; every other large test has a targeted cadence; process-marker and duplicate-family counts materially decline. |
 | 5 | Source/manifest ratchets block drift; `TESTING.md` is truthful; `CI / required` is protected after its p95 sample; releases require exact-SHA evidence. |
@@ -1522,7 +1735,11 @@ Reviewers should reject a migration when:
 - a new port mirrors a producer's broad API instead of the consumer's need;
 - a test passes only because a required subtest skipped;
 - process-global mutation makes parallel callers unsafe; or
-- a faster shard merely moved work to an unowned workflow.
+- a faster shard merely moved work to an unowned workflow;
+- a shared policy branch matrix is copied into adapters instead of being owned
+  once; or
+- a new architecture rule scans raw source text when syntax/type identity can
+  express it.
 
 For code changes, TDD means the sequence is visible: failing focused proof,
 minimal implementation, passing focused proof, applicable contract, broader
@@ -1536,23 +1753,29 @@ This plan is a companion, not a replacement, for:
 
 - [Two-minute CI on Blacksmith](../design/two-minute-ci-blacksmith.md), which
   owns timing storage, runnable-unit planning, sharding, runner images, path
-  gating, and CI summary topology. This audit owns the architecture and
+  gating, and CI summary topology after its missing tracker is replaced with an
+  assigned child under `ga-80po0c`. This audit owns the architecture and
   truthfulness of those runnable units.
 - [Worker API hardening Task 4](worker-api-hardening-plan.md#task-4-add-structured-worker-operation-events-and-reduce-polling),
-  which owns structured Worker operation events. W5 consumes them rather than
-  inventing a second Worker event model.
+  whose Pending status is stale: structured Worker operation events landed in
+  `c86f102bc`. W5 can migrate Worker waits now and does not invent a second
+  Worker event model.
 - [Dolt contract quality hardening Task 7](dolt-quality-hardening-plan.md#task-7-extract-managed-lifecycle-publication-and-ownership-from-gc-beads-bd)
   and [Task 8](dolt-quality-hardening-plan.md#task-8-introduce-a-dolt-state-brokercache-for-steady-state-consumers),
   which own managed lifecycle publication and the state broker. W5 migrates
-  test waits after that ownership exists.
-- [Session test-double migration](../plans/store-domain-objects/test-double-migration-plan.md),
-  which already inventories roughly 498 raw session-bead fixture sites and
-  defines the real MemStore-backed `sessiontest` direction. D3 is its execution
-  wave, not a competing fixture system.
-- Open PR [#4193](https://github.com/gastownhall/gascity/pull/4193), which
-  demonstrates the immediate under-five-minute topology and removes several
-  duplicate CI/provider paths on its branch. P0.1 adopts those changes before
-  later tasks rely on them.
+  test waits after that ownership exists and consumes #4197's reopen seam
+  rather than inventing another reconnect path; Tasks 7/8 need assigned child
+  beads under `ga-80po0c` before that half is schedulable.
+- Merged PR [#4158](https://github.com/gastownhall/gascity/pull/4158)
+  (`25d395fc0`), which completed the `sessiontest` fixture
+  cutover and left a permanent-zero guard. This plan retains that boundary and
+  does not schedule the archived ~498-site migration again.
+- Merged PR [#4193](https://github.com/gastownhall/gascity/pull/4193), which
+  establishes the immediate under-five-minute topology and removes several
+  duplicate CI/provider paths. P0.1 prevents those gains from regressing.
+- Merged PR [#4197](https://github.com/gastownhall/gascity/pull/4197), which
+  owns NativeDoltStore reopen/retry lifecycle semantics and the path-targeted
+  real hard-kill/port-rebind proof.
 
 If an owning plan changes its boundary, update the references here rather than
 forking its production design inside a test helper.
@@ -1605,8 +1828,9 @@ This program is complete when:
 - J1-J4 are the only generic PR-blocking whole-system journeys and every other
   large proof has an owned targeted cadence;
 - the entire small loop has p95 <=60s and focused packages p95 <=5s;
-- the fixed-sleep, process-marker, env/cwd, and broad-fake burn-down thresholds
-  in the architectural ratchets are met without relabeling the debt;
+- the checked fixed-sleep, process-marker, env/cwd, and broad-fake debt ledgers
+  do not regress, and approved invariant-owned burn-down milestones are met
+  without relabeling the debt;
 - `CI / required` passes the 20-run protection overlap and then holds p95
   <=4m30s with every non-platform-outage full-union run under five minutes over
   the rolling 200-run operating window;
@@ -1618,11 +1842,20 @@ This program is complete when:
 
 ## Reproducing the census
 
-Run from the repository root:
+This is a source census across every tracked `*_test.go` file and all build
+tags/OS variants, not the runnable set for one platform. The historical test
+regex includes `TestMain`; the runnable count excludes it explicitly. Exact
+tag counts use `^//go:build <tag>$`; compound, native, and OS expressions belong
+in “Other.” Run from the repository root:
 
 ```bash
 rg --files -g '*_test.go' | wc -l
+# Historical-compatible source count; includes TestMain.
 rg -g '*_test.go' '^func Test[A-Za-z0-9_]*\(' | wc -l
+# Runnable Test functions only.
+rg --pcre2 -g '*_test.go' '^func Test(?!Main\()[A-Za-z0-9_]*\(' | wc -l
+# TestMain entrypoints.
+rg -g '*_test.go' '^func TestMain\(' | wc -l
 rg --files -g '*_test.go' | xargs wc -l | tail -1
 comm -23 <(rg --files -g '*.go' | sort) <(rg --files -g '*_test.go' | sort) \
   | xargs wc -l | tail -1
