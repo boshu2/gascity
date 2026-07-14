@@ -9408,6 +9408,10 @@ export type GetV0CityByCityNameConvoysData = {
 
 export type GetV0CityByCityNameConvoysErrors = {
     /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
      * Not Found
      */
     404: ErrorModel;
@@ -15638,6 +15642,10 @@ export type GetV0CityByCityNameSessionsData = {
 };
 
 export type GetV0CityByCityNameSessionsErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
     /**
      * Not Found
      */
