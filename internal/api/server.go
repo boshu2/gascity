@@ -21,22 +21,21 @@ import (
 // lifetimes or block shutdown on a slow downstream.
 const extmsgNotifyTimeout = 30 * time.Second
 
-// backgroundCtx returns a context that is explicitly detached from the
-// request but has a bounded timeout. Use for fire-and-forget work
-// (extmsg member notification, log-write fanouts) so goroutines cannot
-// outlive reasonable bounds. When the server gains a shutdown ctx in
-// the future, derive from that instead.
-//
-// The returned cancel is intentionally captured inside a goroutine that
-// exits on ctx.Done(), so go vet's lostcancel check stays happy while
-// the timeout still prevents unbounded accumulation.
-func (s *Server) backgroundCtx() context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), extmsgNotifyTimeout)
+// runBackground owns one detached, bounded task. The task is visible to
+// waitForBackground so tests and a future server shutdown path can wait for
+// side effects before releasing the state they use.
+func (s *Server) runBackground(run func(context.Context)) {
+	s.backgroundTasks.Add(1)
 	go func() {
-		<-ctx.Done()
-		cancel()
+		defer s.backgroundTasks.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), extmsgNotifyTimeout)
+		defer cancel()
+		run(ctx)
 	}()
-	return ctx
+}
+
+func (s *Server) waitForBackground() {
+	s.backgroundTasks.Wait()
 }
 
 // Server is the per-city handler-host. It owns the per-city State and
@@ -60,6 +59,8 @@ type Server struct {
 	// resolved once from Config(). Immutable for the Server lifetime, mirroring
 	// readOnly; the S2+/S3 handler consumers read it.
 	bootFlags rollout.Flags
+
+	backgroundTasks sync.WaitGroup
 
 	// sessionLogSearchPaths overrides the default search paths for Claude
 	// session JSONL files. Nil means use worker.DefaultSearchPaths().

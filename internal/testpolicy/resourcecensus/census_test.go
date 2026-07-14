@@ -98,6 +98,78 @@ func TestLocalNamesAreNotStdlibCalls() {
 	assertCount(t, got, ScopeUntagged, ResourceFixedSleep, 1, 1)
 }
 
+func TestScanCountsHTTPTestServerConstructorsByImportIdentity(t *testing.T) {
+	t.Parallel()
+
+	files := fstest.MapFS{
+		"sample/resources_test.go": &fstest.MapFile{Data: []byte(`package sample
+import (
+	foreign "example.test/httptest"
+	servers "net/http/httptest"
+	"testing"
+)
+
+type localServers struct{}
+func (localServers) NewServer(any) {}
+func (localServers) NewTLSServer(any) {}
+func (localServers) NewUnstartedServer(any) {}
+
+func TestHTTPTestServers(t *testing.T) {
+	_ = ((servers.NewServer))(nil)
+	_ = (((servers)).NewTLSServer)(nil)
+	t.Run("nested", func(t *testing.T) {
+		_ = ((servers.NewUnstartedServer))(nil)
+	})
+
+	local := localServers{}
+	local.NewServer(nil)
+	local.NewTLSServer(nil)
+	local.NewUnstartedServer(nil)
+	foreign.NewServer(nil)
+	foreign.NewTLSServer(nil)
+	foreign.NewUnstartedServer(nil)
+	_ = "servers.NewServer(nil); servers.NewTLSServer(nil); servers.NewUnstartedServer(nil)"
+	// servers.NewServer(nil)
+	// servers.NewTLSServer(nil)
+	// servers.NewUnstartedServer(nil)
+}
+`)},
+		"sample/tagged_test.go": &fstest.MapFile{Data: []byte(`//go:build integration
+
+package sample
+import (
+	"net/http/httptest"
+	"testing"
+)
+func TestTaggedHTTPTestServer(t *testing.T) {
+	_ = httptest.NewServer(nil)
+}
+`)},
+	}
+
+	got, err := ScanFS(files)
+	if err != nil {
+		t.Fatalf("ScanFS: %v", err)
+	}
+	assertCount(t, got, ScopeAll, ResourceHTTPTestServer, 4, 2)
+	assertCount(t, got, ScopeUntagged, ResourceHTTPTestServer, 3, 1)
+
+	for _, occurrence := range got.Occurrences {
+		if occurrence.Resource != ResourceHTTPTestServer {
+			continue
+		}
+		wantOwner := "TestHTTPTestServers"
+		wantTagged := false
+		if occurrence.Path == "sample/tagged_test.go" {
+			wantOwner = "TestTaggedHTTPTestServer"
+			wantTagged = true
+		}
+		if occurrence.PackageDir != "sample" || occurrence.PackageName != "sample" || occurrence.Owner != wantOwner || !occurrence.Runnable || occurrence.Tagged != wantTagged {
+			t.Errorf("HTTP test server occurrence = %+v, want package sample/sample owner=%s runnable=true tagged=%t", occurrence, wantOwner, wantTagged)
+		}
+	}
+}
+
 func TestScanCountsCmdGCProcessGlobalsByLexicalOwnership(t *testing.T) {
 	t.Parallel()
 
@@ -697,6 +769,15 @@ import . "testing"
 func TestResource(t *T) { t.Setenv("KEY", "value") }
 `,
 		},
+		{
+			name:       "net http httptest",
+			path:       "sample/dot_httptest_test.go",
+			importPath: "net/http/httptest",
+			source: `package sample
+import . "net/http/httptest"
+func TestResource() { _ = NewServer(nil) }
+`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -715,6 +796,7 @@ func TestScanAllowsBlankImportsOfTargetedPackages(t *testing.T) {
 	files := fstest.MapFS{
 		"sample/blank_import_test.go": &fstest.MapFile{Data: []byte(`package sample
 import (
+	_ "net/http/httptest"
 	_ "os"
 	_ "os/exec"
 	_ "testing"
@@ -1121,6 +1203,17 @@ func TestValidateUsesCodeOwnedBootstrapPolicy(t *testing.T) {
 	}
 }
 
+func TestBootstrapPolicyOwnsHTTPTestServerDebt(t *testing.T) {
+	t.Parallel()
+
+	for _, rows := range [][]Baseline{bootstrapPolicy.Debt, bootstrapPolicy.SmallDebt} {
+		row := findRow(t, rows, ScopeUntagged, ResourceHTTPTestServer)
+		if row.OwnerBead != "ga-80po0c.2.2" || row.MigrationTarget != "P0.4c" {
+			t.Fatalf("HTTP test server owner = %q/%q, want ga-80po0c.2.2/P0.4c", row.OwnerBead, row.MigrationTarget)
+		}
+	}
+}
+
 func TestValidateRequiresTheExactBootstrapRowSet(t *testing.T) {
 	t.Parallel()
 
@@ -1230,7 +1323,7 @@ func TestParseLedgerRejectsUndeclaredFields(t *testing.T) {
 	requireErrorContains(t, err, "unknown ledger field: mystery")
 }
 
-func TestParseLedgerRejectsClassificationFields(t *testing.T) {
+func TestParseLedgerRejectsUndeclaredClassificationFields(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -1238,8 +1331,8 @@ func TestParseLedgerRejectsClassificationFields(t *testing.T) {
 		data string
 		want string
 	}{
-		{"medium rows", "version = 1\n[[medium]]\npackage = 'sample'\n", "unknown ledger field: medium"},
-		{"small debt rows", "version = 1\n[[small_debt]]\nscope = 'untagged'\n", "unknown ledger field: small_debt"},
+		{"medium field", "version = 2\n[[medium]]\npackage_dir = 'sample'\nmystery = true\n", "unknown ledger field: medium.mystery"},
+		{"small debt field", "version = 2\n[[small_debt]]\nscope = 'untagged'\nintended_size = 'small'\n", "unknown ledger field: small_debt.intended_size"},
 		{"size field", "version = 1\n[[debt]]\nscope = 'untagged'\nintended_size = 'small'\n", "unknown ledger field: debt.intended_size"},
 	}
 	for _, tt := range tests {
@@ -1254,7 +1347,7 @@ func TestRenderMarkdownIsDeterministic(t *testing.T) {
 	t.Parallel()
 
 	ledger := Ledger{
-		Version: 1,
+		Version: 2,
 		AuditBaseline: []Baseline{
 			validAudit(ScopeAll, ResourceFixedSleep, 4, 2),
 		},
@@ -1262,12 +1355,20 @@ func TestRenderMarkdownIsDeterministic(t *testing.T) {
 			validDebt(ScopeUntagged, ResourceSubprocess, 3, 2),
 			validDebt(ScopeCmdGCUntagged, ResourceCWD, 2, 1),
 		},
+		Medium: []MediumOwner{
+			validMediumOwner("sample", "sample", "TestOwned", ResourceSubprocess),
+		},
+		SmallDebt: []Baseline{
+			validDebt(ScopeUntagged, ResourceFixedSleep, 1, 1),
+		},
 	}
 	got := RenderMarkdown(ledger)
 	want := `<!-- BEGIN CHECKED TEST RESOURCE LEDGER -->
 | Ledger kind | Source scope | Resource baseline | Tracking owner | Invariant / resource owner | Migration | Expiry |
 | --- | --- | --- | --- | --- | --- | --- |
 | Audit baseline | all tracked test source | fixed_sleep: 4 calls / 2 files | P0.4 | source census only; does not classify tests; audit owner | P0.4a | 2026-10-01 |
+| Medium owner | ` + "`sample`" + ` package ` + "`sample`" + ` | TestOwned: subprocess | ga-test | exact runnable owner; lexical declaration | P0.4b | 2026-10-01 |
+| Small debt ratchet | all untagged test source | fixed_sleep: 1 calls / 1 files | P0.4 | existing debt cannot grow; owning test cleanup | D1/D2 | 2026-10-01 |
 | Source debt ratchet | ` + "`cmd/gc`" + ` untagged test source | cwd: 2 calls / 1 files | P0.4 | existing debt cannot grow; owning test cleanup | D5/D6 | 2026-10-01 |
 | Source debt ratchet | all untagged test source | subprocess: 3 calls / 2 files | P0.4 | existing debt cannot grow; owning test cleanup | D1/D2 | 2026-10-01 |
 <!-- END CHECKED TEST RESOURCE LEDGER -->`
@@ -1335,12 +1436,19 @@ func validLedger(census Census) Ledger {
 	cmdGCCWD := census.Count(ScopeCmdGCUntagged, ResourceCWD)
 	cmdGCSlowProcessGate := census.Count(ScopeCmdGCUntagged, ResourceSlowProcessGate)
 	return Ledger{
-		Version: 1,
+		Version: 2,
 		AuditBaseline: []Baseline{
 			validAudit(ScopeAll, ResourceSubprocess, allSubprocess.Calls, allSubprocess.Files),
 			validAudit(ScopeAll, ResourceFixedSleep, allSleep.Calls, allSleep.Files),
 		},
 		Debt: []Baseline{
+			validDebt(ScopeUntagged, ResourceSubprocess, untaggedSubprocess.Calls, untaggedSubprocess.Files),
+			validDebt(ScopeUntagged, ResourceFixedSleep, untaggedSleep.Calls, untaggedSleep.Files),
+			validDebt(ScopeCmdGCUntagged, ResourceEnvironment, cmdGCEnvironment.Calls, cmdGCEnvironment.Files),
+			validDebt(ScopeCmdGCUntagged, ResourceCWD, cmdGCCWD.Calls, cmdGCCWD.Files),
+			validDebt(ScopeCmdGCUntagged, ResourceSlowProcessGate, cmdGCSlowProcessGate.Calls, cmdGCSlowProcessGate.Files),
+		},
+		SmallDebt: []Baseline{
 			validDebt(ScopeUntagged, ResourceSubprocess, untaggedSubprocess.Calls, untaggedSubprocess.Files),
 			validDebt(ScopeUntagged, ResourceFixedSleep, untaggedSleep.Calls, untaggedSleep.Files),
 			validDebt(ScopeCmdGCUntagged, ResourceEnvironment, cmdGCEnvironment.Calls, cmdGCEnvironment.Files),
@@ -1386,6 +1494,11 @@ func cloneLedger(source Ledger) Ledger {
 	clone := source
 	clone.AuditBaseline = append([]Baseline(nil), source.AuditBaseline...)
 	clone.Debt = append([]Baseline(nil), source.Debt...)
+	clone.SmallDebt = append([]Baseline(nil), source.SmallDebt...)
+	clone.Medium = append([]MediumOwner(nil), source.Medium...)
+	for index := range clone.Medium {
+		clone.Medium[index].Resources = append([]Resource(nil), source.Medium[index].Resources...)
+	}
 	return clone
 }
 

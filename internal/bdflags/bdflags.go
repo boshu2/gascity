@@ -3,10 +3,7 @@
 // and the gc lint check that validates bd invocations embedded in prompt
 // templates, so the two call sites cannot drift apart from each other.
 //
-// Sourced from bd <sub> --help output (2026-07-05, bd v1.1.0); create's
-// -s/--status added 2026-07-14 from bd v1.1.0 (dev) --help (the manifest is a
-// superset of the installed bd's real flags, so release builds without the
-// flag stay valid).
+// Sourced from bd <sub> --help output (2026-07-13, bd v1.1.0).
 package bdflags
 
 import "sort"
@@ -39,9 +36,8 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"--external-ref": true, "-f": true, "--file": true, "--graph": true,
 		"--id": true, "-l": true, "--labels": true, "--metadata": true,
 		"--mol-type": true, "--notes": true, "--parent": true, "-p": true,
-		"--priority": true, "--repo": true, "-s": true, "--skills": true,
-		"--spec-id": true, "--status": true, "--title": true, "-t": true,
-		"--type": true, "--waits-for": true,
+		"--priority": true, "--repo": true, "--skills": true, "--spec-id": true,
+		"-s": true, "--status": true, "--title": true, "-t": true, "--type": true, "--waits-for": true,
 		"--waits-for-gate": true, "--wisp-type": true,
 	},
 	"update": {
