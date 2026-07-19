@@ -142,6 +142,12 @@ func ensureInstanceToken(env map[string]string) (map[string]string, error) {
 		}
 		cloned["GC_INSTANCE_TOKEN"] = token
 	}
+	// Keep BEADS_HOLDER_TOKEN aligned to GC_INSTANCE_TOKEN. Managed starts set
+	// both via session.RuntimeEnv, but this backstop is the unmanaged/legacy path
+	// where GC_INSTANCE_TOKEN can be minted (or arrive) without a matching holder
+	// token — a divergent or absent holder token is a silent actor-only downgrade
+	// the template-inspecting gate cannot see (ownership-fencing DESIGN §2.4).
+	cloned["BEADS_HOLDER_TOKEN"] = cloned["GC_INSTANCE_TOKEN"]
 	return cloned, nil
 }
 
@@ -324,9 +330,30 @@ func (p *Provider) FindRuntimesBySessionID(id string) ([]runtime.LiveRuntime, er
 	found, scanErr := proctable.ScanBySessionID(id)
 	running, listErr := p.ListRunning("")
 	if listErr != nil {
-		for i := range found {
-			found[i].IsTracked = true
-		}
+		// Fail CLOSED: without the live-session list we cannot prove which
+		// scanned roots are gc-tracked. Marking them all tracked (the previous
+		// behavior) told killExistingOrphans to skip every one, so an escaped
+		// old process for this exact session survived alongside its
+		// replacement. Leave IsTracked=false instead: the caller then targets
+		// the same-session, same-city roots the /proc scan surfaced, and only
+		// starts once they are confirmed dead.
+		//
+		// TRADE-OFF (gascity D1 / MEDIUM-2): when listErr is a *transient*
+		// tmux-list hiccup rather than a truly-gone server, a still-live
+		// session's root can land here untracked and be targeted for kill —
+		// the same tmux machinery backs ensureRunning's !IsRunning gate, so a
+		// blip flips both. We accept this over the alternative (a survivor
+		// racing the replacement for the same work bead, causing duplicate bd
+		// closes), because the survivor bug is silent and corrupts work state
+		// while a wrongful kill is loud and self-heals on the next reconcile.
+		// Two mitigations bound the blast radius: (1) KillByPID confirms death
+		// by PID + /proc start-time identity (pidutil.AliveWithStartTime), so a
+		// genuinely-live root is never misreported as dead — if it resists the
+		// kill it surfaces a real "not confirmed dead" error; and (2) that
+		// error propagates through killExistingOrphans to every gated Start,
+		// which then refuses rather than racing. Independently re-deriving
+		// "is this the current live session" here would require the very
+		// ListRunning that just failed, so it is intentionally not attempted.
 		return found, errors.Join(scanErr, fmt.Errorf("tmux list running: %w", listErr))
 	}
 
@@ -592,9 +619,22 @@ func (p *Provider) Peek(name string, lines int) (string, error) {
 }
 
 // ListRunning returns all tmux session names matching the given prefix.
+//
+// A totally unreachable tmux server (ErrNoServer) is reported as a
+// [runtime.PartialListError] with a nil names slice rather than an empty
+// success: a single-tmux outage is a failed observation, not proof that zero
+// sessions exist. This activates the reconciler-facing IsPartialListError
+// guards (pool on_death, provider swap, shutdown listing, orphan cleanup) so a
+// brief server blip defers destructive action instead of tearing down healthy
+// sessions. It mirrors the multi-backend degraded-but-usable signal that
+// [runtime.MergeBackendListResults] produces for composite providers, and is
+// the ListRunning-side analog of the StateCache liveness fix in #4082.
 func (p *Provider) ListRunning(prefix string) ([]string, error) {
-	all, err := p.tm.ListSessions()
+	all, err := p.tm.listSessionNames()
 	if err != nil {
+		if errors.Is(err, ErrNoServer) {
+			return nil, &runtime.PartialListError{Err: fmt.Errorf("tmux server unreachable: %w", err)}
+		}
 		return nil, err
 	}
 	var matched []string
@@ -1148,6 +1188,17 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	}
 	if !alive {
 		return fmt.Errorf("relaunch: %w: %s (box must be provisioned first)", runtime.ErrSessionNotFound, name)
+	}
+
+	// Run pre_start before respawning: relaunch re-homes the agent into a
+	// possibly different (or not-yet-prepared) WorkDir, and launching into an
+	// unprepared workDir can point agents at the wrong repo — the same
+	// rationale that makes pre_start failures fatal in doStartSession.
+	if err := runPreStart(ctx, ops, name, cfg, setupTimeout); err != nil {
+		return fmt.Errorf("relaunch: running pre_start: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	fullCommand, promptFile, err := buildLaunchCommand(name, cfg)

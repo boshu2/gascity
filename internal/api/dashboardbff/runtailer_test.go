@@ -1,29 +1,51 @@
 package dashboardbff
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runproj"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
-type fakeResolver struct{ paths map[string]string }
+type fakeResolver struct {
+	paths map[string]string
+	// cities, when non-nil, is what Cities returns (so a test can control the
+	// eager-warm set and ordering independently of the CityPath map, or model a
+	// resolver whose registry is empty at Start). When nil, Cities is derived
+	// from paths so existing tests get eager-warming for free.
+	cities []CityRef
+}
 
 func (f fakeResolver) CityPath(name string) (string, bool) {
 	p, ok := f.paths[name]
 	return p, ok
+}
+
+func (f fakeResolver) Cities() []CityRef {
+	if f.cities != nil {
+		return f.cities
+	}
+	refs := make([]CityRef, 0, len(f.paths))
+	for name, path := range f.paths {
+		refs = append(refs, CityRef{Name: name, Path: path})
+	}
+	return refs
 }
 
 // runMoleculeEvent builds a bead.created event for a run-molecule lane carrying
@@ -124,7 +146,7 @@ func TestRunTailerColdLoadAndLiveTail(t *testing.T) {
 
 	select {
 	case <-tl.readyCh:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.GoroutineRaceTimeout):
 		t.Fatal("cold replay did not complete")
 	}
 	waitForLanes(t, tl, 1)
@@ -133,6 +155,179 @@ func TestRunTailerColdLoadAndLiveTail(t *testing.T) {
 	appendEvents(t, logPath, runMoleculeEvent(2, "run2", "mol-design-review-v2", "worker-2"))
 	waitForLanes(t, tl, 2)
 
+	cancel()
+	wg.Wait()
+}
+
+func TestRunTailerManagerRebindsChangedEventsPath(t *testing.T) {
+	firstDir := t.TempDir()
+	firstPath := filepath.Join(firstDir, ".gc", "events.jsonl")
+	writeEventLog(t, firstPath, runMoleculeEvent(1, "run-first", "test-formula", ""))
+	secondDir := t.TempDir()
+	secondPath := filepath.Join(secondDir, ".gc", "events.jsonl")
+	writeEventLog(t, secondPath, runMoleculeEvent(1, "run-second", "test-formula", ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	m := newRunTailerManager(Deps{})
+	m.enable(ctx, &wg)
+	first := m.ensure("alpha", firstPath)
+	select {
+	case <-first.readyCh:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("first cold replay did not complete")
+	}
+	waitForLanes(t, first, 1)
+
+	replacement := m.ensure("alpha", secondPath)
+	if replacement == first {
+		t.Fatal("changed events path reused the old city tailer")
+	}
+	if got := m.ensure("alpha", secondPath); got != replacement {
+		t.Fatal("unchanged replacement path did not reuse the new tailer")
+	}
+	select {
+	case <-first.doneCh:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("replaced path-bound tailer did not stop")
+	}
+	select {
+	case <-replacement.readyCh:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("replacement cold replay did not complete")
+	}
+	waitForLanes(t, replacement, 1)
+	replacement.mu.RLock()
+	hasSecond := lanePresent(replacement, "run-second")
+	hasFirst := lanePresent(replacement, "run-first")
+	ids := laneIDsOf(replacement.summary.Lanes)
+	replacement.mu.RUnlock()
+	if !hasSecond || hasFirst {
+		t.Fatalf("replacement lanes = %v, want only run-second", ids)
+	}
+}
+
+func TestRunTailerLogsColdLoadFailureOnce(t *testing.T) {
+	previousLoad := readRunColdLoad
+	readRunColdLoad = func(*runproj.Projector, string) error {
+		return errors.New("cold disk unavailable")
+	}
+	t.Cleanup(func() { readRunColdLoad = previousLoad })
+
+	var logs bytes.Buffer
+	previousLog := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLog) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	m := newRunTailerManager(Deps{})
+	m.enable(ctx, &wg)
+	tailer := m.ensure("alpha", filepath.Join(t.TempDir(), ".gc", "events.jsonl"))
+	select {
+	case <-tailer.readyCh:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		cancel()
+		wg.Wait()
+		t.Fatal("cold replay attempt did not complete")
+	}
+
+	cancel()
+	wg.Wait()
+	if got := strings.Count(logs.String(), "cold replay failed"); got != 1 {
+		t.Fatalf("cold replay failure log count = %d, want 1; logs=%q", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "cold disk unavailable") {
+		t.Fatalf("cold replay log omitted raw cause: %q", logs.String())
+	}
+}
+
+// TestRunTailerPrimeDoesNotBlockLiveTail is the regression guard for the
+// startup sessions-prime blocking live polling: the best-effort prime runs off
+// the tail's poll goroutine, so a slow or hung /v0 sessions loopback read cannot
+// delay folding events appended right after cold replay — the exact startup
+// window the eager warm-up exists to cover. A /sessions handler that never
+// responds stands in for the stalled loopback; the tail must still fold a
+// post-ready append while that prime is parked.
+func TestRunTailerPrimeDoesNotBlockLiveTail(t *testing.T) {
+	defer func(prev time.Duration) { runTailPollInterval = prev }(runTailPollInterval)
+	runTailPollInterval = 15 * time.Millisecond
+
+	// /sessions blocks until released, standing in for a slow or hung loopback
+	// read. The post-cold-load prime issues exactly this request; if it ran inline
+	// on the tail's poll goroutine, live folding would stall here for up to the
+	// HTTP client timeout (runSessionsFetchTimeout, 10s) — far past this test's
+	// deadlines.
+	var sessionsHits atomic.Int64
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	supervisor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/sessions") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		sessionsHits.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"total":0}`))
+	}))
+	defer supervisor.Close()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, ".gc", "events.jsonl")
+	writeEventLog(t, logPath, runMoleculeEvent(1, "run1", "mol-adopt-pr-v2", "worker-1"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	m := newRunTailerManager(Deps{SupervisorBaseURL: supervisor.URL})
+	m.enable(ctx, &wg)
+	tl := m.ensure("alpha", logPath)
+
+	select {
+	case <-tl.readyCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cold replay did not complete")
+	}
+	waitForLanes(t, tl, 1)
+
+	// The prime fires right after readyCh closes. Wait until it is in-flight and
+	// parked in /sessions, so the append below races a genuinely-stalled prime
+	// rather than one that already returned.
+	deadline := time.Now().Add(2 * time.Second)
+	for sessionsHits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sessionsHits.Load(); got != 1 {
+		t.Fatalf("sessions prime not in-flight after cold replay: hits=%d, want 1", got)
+	}
+
+	// Append a new run AFTER cold replay (post-ready), so only the live tail poll
+	// can fold it (captureTailCursor took the offset before the replay). With the
+	// prime moved OFF the poll goroutine, the tail folds it within a few poll
+	// intervals even though the prime is still parked — release is not closed until
+	// cleanup. Inline priming would stall the poll here and this waitForLanes would
+	// time out.
+	appendEvents(t, logPath, runMoleculeEvent(2, "run2", "mol-design-review-v2", "worker-2"))
+	waitForLanes(t, tl, 2)
+
+	// The fold above completed while the prime was still parked in /sessions,
+	// proving the prime never gated live polling.
+	if got := sessionsHits.Load(); got != 1 {
+		t.Fatalf("sessions prime hits = %d, want exactly 1 in-flight parked prime", got)
+	}
+
+	unblock()
 	cancel()
 	wg.Wait()
 }
@@ -340,6 +535,60 @@ func TestRunTailerStartupCursorRotationRaceDoesNotSkip(t *testing.T) {
 	}
 }
 
+func TestRunTailerRotationDuringActiveReadDoesNotCommitUnverifiedCursor(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, ".gc", "events.jsonl")
+	writeEventLog(t, logPath, runMoleculeEvent(1, "run1", "test-formula", ""))
+
+	tailer := &cityRunTailer{name: "alpha", eventsPath: logPath, readyCh: make(chan struct{})}
+	projector := runproj.NewProjector()
+	if err := projector.ColdLoad(logPath); err != nil {
+		t.Fatalf("cold load: %v", err)
+	}
+	state := captureTailCursor(logPath)
+	state.marks = tailer.build(projector, nil, nil)
+	oldOffset := state.offset
+	appendEvents(t, logPath, runMoleculeEvent(2, "run2", "test-formula", ""))
+
+	previous := readTailEvents
+	t.Cleanup(func() { readTailEvents = previous })
+	rotated := false
+	readTailEvents = func(path string, offset int64) ([]events.Event, int64, error) {
+		evts, nextOffset, err := previous(path, offset)
+		if err == nil && !rotated {
+			rotated = true
+			rotating := filepath.Join(filepath.Dir(path), "events.jsonl.rotating-20260601T120000Z-seq-1-2")
+			if err := os.Rename(path, rotating); err != nil {
+				t.Fatalf("rotate after active read: %v", err)
+			}
+			writeEventLog(t, path, runMoleculeEvent(3, "run3", "test-formula", ""))
+		}
+		return evts, nextOffset, err
+	}
+
+	tailer.foldNext(projector, state)
+	if got := projector.LastSeq(); got != 1 {
+		t.Fatalf("projector cursor = %d, want 1 until active read identity is verified", got)
+	}
+	if state.offset != oldOffset {
+		t.Fatalf("byte cursor = %d, want preserved %d after unverified active read", state.offset, oldOffset)
+	}
+	if !tailer.summary.LanesPartial {
+		t.Fatal("rotation during active read did not mark projection partial")
+	}
+
+	readTailEvents = previous
+	tailer.foldNext(projector, state)
+	for _, want := range []string{"run1", "run2", "run3"} {
+		if !lanePresent(tailer, want) {
+			t.Errorf("lane %q missing after verified rotation recovery; lanes=%v", want, laneIDsOf(tailer.summary.Lanes))
+		}
+	}
+	if tailer.summary.LanesPartial {
+		t.Fatal("verified rotation recovery did not clear recoverable incompleteness")
+	}
+}
+
 // TestRunTailerRotationCatchUpErrorRetriesNextPoll is the regression guard for
 // the rotation catch-up state-commit gap: on a detected rotation the tailer must
 // catch up the just-rotated events (now only in the archive) BEFORE advancing its
@@ -380,10 +629,15 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 	// Fail the first catch-up read, then fall through to the real reader.
 	defer func(prev func(string, events.Filter) ([]events.Event, error)) { readRotationCatchUp = prev }(readRotationCatchUp)
 	realCatchUp := events.ReadFilteredWithInFlight
+	var logs bytes.Buffer
+	previousLog := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLog) })
+
 	calls := 0
 	readRotationCatchUp = func(path string, f events.Filter) ([]events.Event, error) {
 		calls++
-		if calls == 1 {
+		if calls <= 2 {
 			return nil, errors.New("transient catch-up read error")
 		}
 		return realCatchUp(path, f)
@@ -391,6 +645,8 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 
 	// First poll: catch-up errors. Nothing folds, and the tailer must not advance
 	// its active identity or the next poll can no longer re-detect the rotation.
+	// It must also publish the projection as incomplete until a cursor-preserving
+	// retry proves that the failed rotation window was recovered.
 	tl.foldNext(proj, st)
 	if lanePresent(tl, "run2") || lanePresent(tl, "run3") || lanePresent(tl, "run4") {
 		t.Fatalf("events folded despite a catch-up error; lanes=%v", laneIDsOf(tl.summary.Lanes))
@@ -398,13 +654,158 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 	if !os.SameFile(preRotationInfo, st.activeInfo) {
 		t.Fatalf("active identity advanced on a catch-up error; the next poll can no longer re-detect the rotation")
 	}
+	if !tl.summary.LanesPartial {
+		t.Fatal("rotation catch-up error did not mark the published projection partial")
+	}
 
-	// Second poll: catch-up succeeds and recovers the whole rotation window.
+	// The active path can be briefly absent while a rotation is between rename
+	// and recreation. ReadFrom treats ENOENT as an empty successful read, but that
+	// must not clear the still-latched catch-up failure before the archived window
+	// is recovered.
+	gapPath := logPath + ".rotation-gap"
+	if err := os.Rename(logPath, gapPath); err != nil {
+		t.Fatalf("stage active-path rotation gap: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := os.Stat(gapPath); err == nil {
+			_ = os.Rename(gapPath, logPath)
+		}
+	})
+	tl.foldNext(proj, st)
+	if !tl.summary.LanesPartial {
+		t.Fatal("ENOENT rotation gap cleared an unresolved catch-up failure")
+	}
+	if err := os.Rename(gapPath, logPath); err != nil {
+		t.Fatalf("restore active path after rotation gap: %v", err)
+	}
+
+	// A repeated poll in the same failed episode remains partial but does not
+	// flood the log at the tailer's one-second production cadence.
+	tl.foldNext(proj, st)
+	if got := strings.Count(logs.String(), "rotation catch-up failed"); got != 1 {
+		t.Fatalf("catch-up failure log count = %d, want 1 for one failure transition; logs=%q", got, logs.String())
+	}
+
+	// Third poll: catch-up succeeds and recovers the whole rotation window.
 	tl.foldNext(proj, st)
 	for _, want := range []string{"run1", "run2", "run3", "run4"} {
 		if !lanePresent(tl, want) {
 			t.Errorf("lane %q missing after catch-up retry; lanes=%v", want, laneIDsOf(tl.summary.Lanes))
 		}
+	}
+	if tl.summary.LanesPartial {
+		t.Fatal("successful cursor-preserving catch-up retry did not clear recoverable incompleteness")
+	}
+}
+
+func TestRunTailerReadErrorPreservesCursorAndMarksProjectionIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, ".gc", "events.jsonl")
+	writeEventLog(t, logPath, runMoleculeEvent(1, "run1", "mol-adopt-pr-v2", "worker-1"))
+
+	tl := &cityRunTailer{name: "alpha", eventsPath: logPath, readyCh: make(chan struct{})}
+	proj := runproj.NewProjector()
+	if err := proj.ColdLoad(logPath); err != nil {
+		t.Fatalf("cold load: %v", err)
+	}
+	st := captureTailCursor(logPath)
+	st.marks = tl.build(proj, nil, nil)
+	appendEvents(t, logPath, runMoleculeEvent(2, "run2", "mol-design-review-v2", "worker-2"))
+	oldOffset := st.offset
+
+	var logs bytes.Buffer
+	previousLog := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLog) })
+
+	previous := readTailEvents
+	t.Cleanup(func() { readTailEvents = previous })
+	failRead := true
+	readTailEvents = func(path string, offset int64) ([]events.Event, int64, error) {
+		if failRead {
+			return nil, 0, errors.New("transient active-log read error")
+		}
+		return previous(path, offset)
+	}
+	tl.foldNext(proj, st)
+	tl.foldNext(proj, st)
+
+	if st.offset != oldOffset {
+		t.Fatalf("offset advanced on read error: got %d, want %d", st.offset, oldOffset)
+	}
+	if !tl.summary.LanesPartial {
+		t.Fatal("active-log read error did not mark the projection partial")
+	}
+	if got := strings.Count(logs.String(), "active-log tail failed"); got != 1 {
+		t.Fatalf("active-tail failure log count = %d, want 1 for one failure transition; logs=%q", got, logs.String())
+	}
+
+	failRead = false
+	gapPath := logPath + ".active-gap"
+	if err := os.Rename(logPath, gapPath); err != nil {
+		t.Fatalf("stage active-path gap: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := os.Stat(gapPath); err == nil {
+			_ = os.Rename(gapPath, logPath)
+		}
+	})
+	tl.foldNext(proj, st)
+	if !tl.summary.LanesPartial {
+		t.Fatal("ENOENT active-path gap cleared an unresolved tail-read failure")
+	}
+	if err := os.Rename(gapPath, logPath); err != nil {
+		t.Fatalf("restore active path after gap: %v", err)
+	}
+
+	tl.foldNext(proj, st)
+	if !lanePresent(tl, "run2") {
+		t.Fatalf("retry from preserved cursor did not recover run2; lanes=%v", laneIDsOf(tl.summary.Lanes))
+	}
+	if tl.summary.LanesPartial {
+		t.Fatal("successful active-log retry did not clear recoverable incompleteness")
+	}
+
+	appendEvents(t, logPath, runMoleculeEvent(3, "run3", "mol-bugflow-v1", "worker-3"))
+	failRead = true
+	tl.foldNext(proj, st)
+	if got := strings.Count(logs.String(), "active-log tail failed"); got != 2 {
+		t.Fatalf("active-tail failure log count after recovery = %d, want 2 transitions; logs=%q", got, logs.String())
+	}
+	failRead = false
+	tl.foldNext(proj, st)
+	if !lanePresent(tl, "run3") || tl.summary.LanesPartial {
+		t.Fatalf("second retry did not recover a complete run3 projection; lanes=%v partial=%v", laneIDsOf(tl.summary.Lanes), tl.summary.LanesPartial)
+	}
+}
+
+func TestRunTailerSuccessfulEmptyRetryClearsIncrementalFailure(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, ".gc", "events.jsonl")
+	writeEventLog(t, logPath, runMoleculeEvent(1, "run1", "test-formula", ""))
+
+	tailer := &cityRunTailer{name: "alpha", eventsPath: logPath, readyCh: make(chan struct{})}
+	projector := runproj.NewProjector()
+	if err := projector.ColdLoad(logPath); err != nil {
+		t.Fatalf("cold load: %v", err)
+	}
+	state := captureTailCursor(logPath)
+	state.marks = tailer.build(projector, nil, nil)
+
+	previous := readTailEvents
+	t.Cleanup(func() { readTailEvents = previous })
+	readTailEvents = func(string, int64) ([]events.Event, int64, error) {
+		return nil, 0, errors.New("transient empty-tail failure")
+	}
+	tailer.foldNext(projector, state)
+	if !tailer.summary.LanesPartial {
+		t.Fatal("read failure did not mark projection partial")
+	}
+
+	readTailEvents = previous
+	tailer.foldNext(projector, state)
+	if tailer.summary.LanesPartial {
+		t.Fatal("successful retry with no new events did not clear recoverable incompleteness")
 	}
 }
 
@@ -516,7 +917,7 @@ type runSummaryWire struct {
 	} `json:"census"`
 }
 
-func getRunSummary(t *testing.T, p *Plane, city string) runSummaryWire {
+func getRunSummary(t *testing.T, p *Plane, city string) runSummaryWire { //nolint:unparam // city is fixed today but kept for parity with the other run helpers
 	t.Helper()
 	rec := httptest.NewRecorder()
 	p.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/city/"+city+"/runs/summary", nil))

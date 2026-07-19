@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -78,6 +79,14 @@ func (p *Provider) runWithContext(parent context.Context, dur time.Duration, std
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, p.script, args...)
+	// Run the adapter in its own process group so cooperative cancellation
+	// reaches a foreground child (e.g. a readiness sleep in the adapter), not
+	// just the shell leader. Without this the shell defers its rollback trap
+	// until the child returns, and WaitDelay force-kills it first — leaking any
+	// resource the adapter already created (e.g. a Docker container).
+	setProcessGroup(cmd)
+	var cancellationAccepted atomic.Bool
+	cmd.Cancel = interruptThenKill(cmd, &cancellationAccepted)
 	// WaitDelay ensures Go forcibly closes I/O pipes after the context
 	// expires, even if grandchild processes (e.g. sleep in a shell script)
 	// still hold them open.
@@ -92,25 +101,78 @@ func (p *Provider) runWithContext(parent context.Context, dur time.Duration, std
 	}
 
 	err := cmd.Run()
-	if err != nil {
-		// Check for exit code 2 → unknown operation → success.
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if exitErr.ExitCode() == 2 {
-				return "", nil
-			}
-		}
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		if len(args) > 0 && args[0] == "start" && strings.Contains(strings.ToLower(errMsg), "already exists") {
-			return "", fmt.Errorf("%w: exec provider %s %s: %s", runtime.ErrSessionExists, p.script, strings.Join(args, " "), errMsg)
-		}
-		return "", fmt.Errorf("exec provider %s %s: %s", p.script, strings.Join(args, " "), errMsg)
+	if err == nil {
+		return strings.TrimRight(stdout.String(), "\n"), nil
 	}
 
-	return strings.TrimRight(stdout.String(), "\n"), nil
+	// An accepted cancellation action wins over the adapter's exit status. In
+	// particular, an INT trap may use protocol-reserved exit 2; treating that as
+	// an unsupported operation would turn cancellation into success. Signal can
+	// race with process completion: a delivered interrupt makes cancellation the
+	// observed winner, while os.ErrProcessDone leaves the flag false and
+	// preserves the ordinary exit result because completion was observed first.
+	// Neither result claims physical signal-delivery ordering.
+	if cancellationAccepted.Load() {
+		return "", p.cancellationError(ctx.Err(), stderr.String(), args)
+	}
+	return "", p.runError(err, stderr.String(), args)
+}
+
+// interruptThenKill builds a [exec.Cmd.Cancel] that first interrupts the
+// adapter's process group so a cooperative adapter — and any foreground child
+// blocking its rollback trap — can roll back before cancellation becomes a
+// forced kill, recording in accepted whether cancellation was delivered so the
+// caller can let it win over the adapter's own exit status. Platforms without
+// process groups or os.Interrupt (such as Windows) fall back to Kill.
+func interruptThenKill(cmd *exec.Cmd, accepted *atomic.Bool) func() error {
+	return func() error {
+		err := interruptProcessGroup(cmd)
+		if err == nil {
+			accepted.Store(true)
+			return nil
+		}
+		if errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+		err = cmd.Process.Kill()
+		if err == nil {
+			accepted.Store(true)
+		}
+		return err
+	}
+}
+
+// cancellationError formats the error returned when a delivered cancellation
+// wins over the adapter's own exit status, preferring the context's cause and
+// attaching any adapter stderr for context.
+func (p *Provider) cancellationError(ctxErr error, stderr string, args []string) error {
+	cancelErr := ctxErr
+	if cancelErr == nil {
+		cancelErr = context.Canceled
+	}
+	if errMsg := strings.TrimSpace(stderr); errMsg != "" {
+		return fmt.Errorf("exec provider %s %s: %s: %w", p.script, strings.Join(args, " "), errMsg, cancelErr)
+	}
+	return fmt.Errorf("exec provider %s %s: %w", p.script, strings.Join(args, " "), cancelErr)
+}
+
+// runError maps an ordinary (non-cancellation) cmd.Run failure onto the
+// provider's contract: exit code 2 is an unknown operation treated as success
+// (forward compatible, nil error), a "start ... already exists" collision maps
+// to [runtime.ErrSessionExists], and everything else wraps the adapter's stderr.
+func (p *Provider) runError(runErr error, stderr string, args []string) error {
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 2 {
+		return nil
+	}
+	errMsg := strings.TrimSpace(stderr)
+	if errMsg == "" {
+		errMsg = runErr.Error()
+	}
+	if len(args) > 0 && args[0] == "start" && strings.Contains(strings.ToLower(errMsg), "already exists") {
+		return fmt.Errorf("%w: exec provider %s %s: %s", runtime.ErrSessionExists, p.script, strings.Join(args, " "), errMsg)
+	}
+	return fmt.Errorf("exec provider %s %s: %s", p.script, strings.Join(args, " "), errMsg)
 }
 
 // runWithTTY executes the script with the terminal inherited (for Attach).
@@ -231,6 +293,10 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	}
 
 	dialogTimeout := runtime.StartupDialogTimeout()
+	// Gate external-CLAUDE.md-import auto-acceptance to imports within this
+	// session's own repository; an import that escapes the repo (a third-party
+	// or system path) is left for a human rather than auto-trusted.
+	trustRoot := runtime.WithTrustedImportRoot(runtime.WorkspaceImportTrustRoot(ctx, cfg.WorkDir))
 	snapshots, closeWatch, ok, err := p.startStartupWatch(ctx, name, startupWatchFirstEventTimeout())
 	if err != nil {
 		return err
@@ -238,6 +304,7 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	if ok {
 		streamObserved, streamErr := runtime.AcceptStartupDialogsFromStreamWithStatus(ctx, dialogTimeout, snapshots,
 			func(keys ...string) error { return p.SendKeys(name, keys...) },
+			trustRoot,
 		)
 		closeErr := closeWatch()
 		switch {
@@ -249,6 +316,7 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 			return runtime.AcceptStartupDialogs(ctx,
 				func(lines int) (string, error) { return p.Peek(name, lines) },
 				func(keys ...string) error { return p.SendKeys(name, keys...) },
+				trustRoot,
 			)
 		}
 	}
@@ -256,6 +324,7 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	return runtime.AcceptStartupDialogs(ctx,
 		func(lines int) (string, error) { return p.Peek(name, lines) },
 		func(keys ...string) error { return p.SendKeys(name, keys...) },
+		trustRoot,
 	)
 }
 
@@ -438,6 +507,16 @@ func formatStartupWatchError(stderr string, err error) error {
 
 // DismissKnownDialogs best-effort clears known trust/permissions dialogs on a
 // running session using a bounded timeout.
+//
+// Unlike the startup path (dismissStartupDialogs), this mid-session clear is
+// deliberately not given a trusted import root: exec has no reliable
+// mid-session work-dir lookup for a running box (the workdir is provision-half
+// and is not persisted to queryable meta), so there is no exec analog of tmux's
+// GetPaneWorkDir here. Leaving the root empty means the external-CLAUDE.md-import
+// modal fails closed on this path — it is left for a human rather than
+// auto-accepted — which is the safe asymmetry: the common startup case is
+// gated, and the rare mid-session re-surface (resume/reattach) never
+// auto-trusts an unverified import.
 func (p *Provider) DismissKnownDialogs(ctx context.Context, name string, timeout time.Duration) error {
 	return runtime.AcceptStartupDialogsWithTimeout(ctx, timeout,
 		func(lines int) (string, error) { return p.Peek(name, lines) },

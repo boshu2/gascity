@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session/sessiontest"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -66,7 +67,7 @@ func TestPrepareStartCandidateStagesScaffoldInResolvedTaskWorkDirWhenCWDIsShared
 	}
 
 	prepared, err := prepareStartCandidateForCity(startCandidate{
-		session: &session,
+		info: sessiontest.SeedBead(t, session),
 		tp: TemplateParams{
 			TemplateName: "gascity/builder",
 			SessionName:  "builder-ga-ajw1no",
@@ -119,11 +120,18 @@ func TestPrepareStartCandidateStagesScaffoldInResolvedTaskWorkDirWhenCWDIsShared
 	for _, rel := range []string{
 		filepath.Join(".claude", "skills", "triage", "SKILL.md"),
 		filepath.Join(".codex", "hooks.json"),
-		filepath.Join(".gc", "settings.json"),
 	} {
 		if _, err := os.Stat(filepath.Join(targetWorkDir, rel)); err != nil {
 			t.Errorf("target scaffold %s missing under resolved workdir %q: %v", rel, targetWorkDir, err)
 		}
+	}
+	// A top-level .gc/ in the overlay source is a runtime mirror and must never
+	// be staged into a session workdir (overlay.skipRuntimeMirror). The session's
+	// own .gc/settings.json is staged separately through the hook-file path
+	// (see claudeSettingsSource/stageHookFiles), not copied verbatim from the
+	// pack overlay, so the mirror is expected to be skipped here.
+	if _, err := os.Stat(filepath.Join(targetWorkDir, ".gc", "settings.json")); !os.IsNotExist(err) {
+		t.Errorf("overlay .gc runtime mirror must not be staged under resolved workdir %q (stat err = %v)", targetWorkDir, err)
 	}
 	if _, err := os.Stat(leakedWorkDir); err == nil {
 		t.Fatalf("shared cwd contains stray bead-slug scaffold directory %q; scaffold must stay under %q", leakedWorkDir, targetWorkDir)

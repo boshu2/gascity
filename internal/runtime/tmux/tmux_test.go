@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -767,7 +768,13 @@ func TestGetPaneCommand_MultiPane(t *testing.T) {
 }
 
 func TestHasDescendantWithNames(t *testing.T) {
-	// Test the hasDescendantWithNames helper function directly
+	if os.Getenv("GC_TMUX_DESCENDANT_HELPER") == "1" {
+		time.Sleep(time.Minute)
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("process-tree traversal uses pgrep")
+	}
 
 	// Test with a definitely nonexistent PID
 	got := hasDescendantWithNames("999999999", []string{"node", "claude"}, 0)
@@ -787,36 +794,27 @@ func TestHasDescendantWithNames(t *testing.T) {
 		t.Error("hasDescendantWithNames should return false for nil names slice")
 	}
 
-	// Test with PID 1 (init/launchd) - should have children but not specific agent processes
-	got = hasDescendantWithNames("1", []string{"node", "claude"}, 0)
-	if got {
-		t.Logf("hasDescendantWithNames(\"1\", [node,claude]) = true - init has matching child?")
+	// Exercise a real process-tree edge without recursively scanning every
+	// process on the host. The helper is a direct child of this test binary.
+	helper := startDescendantTestProcess(t)
+	if !hasDescendantWithNames(strconv.Itoa(os.Getpid()), []string{filepath.Base(os.Args[0])}, 0) {
+		t.Fatalf("hasDescendantWithNames did not find controlled child pid %d", helper.Process.Pid)
 	}
 }
 
-func TestGetAllDescendants(t *testing.T) {
-	// Test the getAllDescendants helper function
+func startDescendantTestProcess(t *testing.T) *exec.Cmd {
+	t.Helper()
 
-	// Test with nonexistent PID - should return empty slice
-	got := getAllDescendants("999999999")
-	if len(got) != 0 {
-		t.Errorf("getAllDescendants(nonexistent) = %v, want empty slice", got)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHasDescendantWithNames$")
+	cmd.Env = append(os.Environ(), "GC_TMUX_DESCENDANT_HELPER=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start descendant helper: %v", err)
 	}
-
-	// Test with PID 1 (init/launchd) - should find some descendants
-	// Note: We can't test exact PIDs, just that the function doesn't panic
-	// and returns reasonable results
-	descendants := getAllDescendants("1")
-	t.Logf("getAllDescendants(\"1\") found %d descendants", len(descendants))
-
-	// Verify returned PIDs are all numeric strings
-	for _, pid := range descendants {
-		for _, c := range pid {
-			if c < '0' || c > '9' {
-				t.Errorf("getAllDescendants returned non-numeric PID: %q", pid)
-			}
-		}
-	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd
 }
 
 func TestKillSessionWithProcesses(t *testing.T) {
@@ -970,55 +968,6 @@ func TestKillSessionWithProcessesExcluding_NonexistentSession(t *testing.T) {
 	err := tm.KillSessionWithProcessesExcluding("nonexistent-session-xyz-12345", []string{"12345"})
 	// We don't care about the error value, just that it doesn't panic
 	_ = err
-}
-
-func TestGetProcessGroupID(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping test: process groups not available on Windows")
-	}
-
-	// Test with current process
-	pid := fmt.Sprintf("%d", os.Getpid())
-	pgid := getProcessGroupID(pid)
-
-	if pgid == "" {
-		t.Error("expected non-empty PGID for current process")
-	}
-
-	// PGID should not be 0 or 1 for a normal process
-	if pgid == "0" || pgid == "1" {
-		t.Errorf("unexpected PGID %q for current process", pgid)
-	}
-
-	// Test with nonexistent PID
-	pgid = getProcessGroupID("999999999")
-	if pgid != "" {
-		t.Errorf("expected empty PGID for nonexistent process, got %q", pgid)
-	}
-}
-
-func TestGetProcessGroupMembers(t *testing.T) {
-	// Get current process's PGID
-	pid := fmt.Sprintf("%d", os.Getpid())
-	pgid := getProcessGroupID(pid)
-	if pgid == "" {
-		t.Skip("could not get PGID for current process")
-	}
-
-	members := getProcessGroupMembers(pgid)
-
-	// Current process should be in the list
-	found := false
-	for _, m := range members {
-		if m == pid {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		t.Errorf("current process %s not found in process group %s members: %v", pid, pgid, members)
-	}
 }
 
 func TestKillSessionWithProcesses_KillsProcessGroup(t *testing.T) {
@@ -1254,66 +1203,6 @@ func TestCleanupOrphanedSessions_NoSessions(t *testing.T) {
 
 	// May clean some existing GT sessions if they exist, but shouldn't error
 	t.Logf("CleanupOrphanedSessions cleaned %d sessions", cleaned)
-}
-
-func TestCollectReparentedGroupMembers(t *testing.T) {
-	// Test that collectReparentedGroupMembers correctly filters group members.
-	// Only processes reparented to init (PPID == 1) that aren't in the known set
-	// should be returned.
-
-	// Test with current process's PGID
-	pid := fmt.Sprintf("%d", os.Getpid())
-	pgid := getProcessGroupID(pid)
-	if pgid == "" {
-		t.Skip("could not get PGID for current process")
-	}
-
-	// Build a known set containing the current process
-	knownPIDs := map[string]bool{pid: true}
-
-	// collectReparentedGroupMembers should NOT include our PID (it's in known set)
-	reparented := collectReparentedGroupMembers(pgid, knownPIDs)
-	for _, rpid := range reparented {
-		if rpid == pid {
-			t.Errorf("collectReparentedGroupMembers returned known PID %s", pid)
-		}
-		// Each reparented PID should have PPID == 1.
-		// The process may have exited between collection and this check
-		// (TOCTOU race), so skip verification if getParentPID returns empty.
-		ppid := getParentPID(rpid)
-		if ppid == "" && runtime.GOOS != "windows" {
-			if err := exec.Command("kill", "-0", rpid).Run(); err != nil {
-				continue
-			}
-		}
-		if ppid != "1" {
-			t.Errorf("collectReparentedGroupMembers returned PID %s with PPID %s (expected 1)", rpid, ppid)
-		}
-	}
-}
-
-func TestGetParentPID(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("getParentPID returns empty string on Windows (no /proc or ps)")
-	}
-
-	// Test with current process - should have a valid PPID
-	pid := fmt.Sprintf("%d", os.Getpid())
-	ppid := getParentPID(pid)
-	if ppid == "" {
-		t.Error("expected non-empty PPID for current process")
-	}
-
-	// PPID should not be "0" for a normal user process
-	if ppid == "0" {
-		t.Error("unexpected PPID 0 for current process")
-	}
-
-	// Test with nonexistent PID
-	ppid = getParentPID("999999999")
-	if ppid != "" {
-		t.Errorf("expected empty PPID for nonexistent process, got %q", ppid)
-	}
 }
 
 func TestKillSessionWithProcesses_DoesNotKillUnrelatedProcesses(t *testing.T) {
@@ -2376,9 +2265,6 @@ func TestProviderEnvSkipsEscapeGrok(t *testing.T) {
 func TestWaitForIdle_Timeout(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
-	}
-	if os.Getenv("TMUX") == "" {
-		t.Skip("not inside tmux")
 	}
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("test requires unix")

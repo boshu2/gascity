@@ -1,5 +1,175 @@
 # Gas City Testing Philosophy
 
+## Checked source-level resource ratchets
+
+`test/test-resources.toml` is the checked P0.4 resource ledger. It scans tracked
+Go source through parsed syntax and import identity, while only `*_test.go`
+files contribute resource occurrences. The raw audit and source-debt rows
+freeze process, sleep, environment, CWD, slow-process, HTTP test-server, and
+package-level `net.Listen`, `net.ListenConfig.Listen`, `net.ListenUnixgram`,
+and direct `syscall.Listen` call/file totals.
+Exact Medium rows name a repository-relative directory, package clause,
+top-level runnable owner, and resource list. Small-debt rows apply those exact
+owners without weakening the raw anti-growth ratchets.
+
+The Go-owned `bootstrapPolicy` pins every row's ceiling, historical totals,
+owner, invariant, resource owner, migration, and expiry. Ordinary source
+growth fails against that ceiling, and TOML-only normalization, relabeling, or
+metadata edits fail against the policy before the live census is compared.
+
+Changing `bootstrapPolicy` together with the TOML and generated table is an
+explicit policy change that requires the same staged-diff council review as
+other test-infrastructure changes. The guard makes ordinary drift visible; it
+does not claim that self-modifying source can be cryptographically forbidden.
+
+`[[reviewed_hermetic_body]]` rows record a narrower fact than a Small-test
+classification: the exact untagged top-level test body and every statically
+resolved receiverless helper in the same package contain none of the resource
+identities cataloged below. A row is exact, code-owned, and stale-checked; it
+cannot use a wildcard, silently move to another test, or claim an effective
+Small size while package setup remains Medium. The checked call graph follows
+direct helper calls and references used as local function aliases across Go
+files in the same package, and terminates safely on cycles.
+
+This is intentionally not a universal hermeticity proof. Cross-package calls,
+method and interface dispatch, package-level callback indirection, and
+resources absent from the catalog remain manual-review boundaries. In
+particular, `TestPrepareWaitWakeState_ResolvesRigDependencyBeads` and
+`TestDoSessionWake_PokesManagedControllerAfterStateChange` have reviewed
+hermetic bodies but still run as Medium because `cmd/gc` owns a process-mutating
+`TestMain`. `TestDoSessionWait_RegistersReadyWaitForRigDependency` has the same
+reviewed-hermetic guarantee for the wait-registration use case.
+`TestCmdSessionWait_AllowsRigDependencyBeads` remains the singular
+CLI/config/file-store split-store composition proof for wait, while
+`TestManagedBdRigProviderStoreRecoversAfterHardKillPortRebind` owns the real
+managed-provider hard-kill/port-rebind boundary. Likewise,
+`TestCmdSessionWake_PokesManagedControllerAndRequestsSuspendedStart` remains the
+singular CLI/config/file-store/controller-socket composition proof for wake.
+`TestDoMailInbox_RendersMessagesFromReader` owns inbox rendering through the
+consumer's one-method reader port, while
+`TestCmdMailInbox_ManagedExecLifecycleProviderReadsInbox` remains the singular
+CLI/mail/`exec:gc-beads-bd` managed-city composition proof. Managed-provider
+recovery stays with the exact provider-store owner instead of being repeated by
+each command consumer. Body review is not a reason to remove a retained
+boundary test.
+
+`TestDockerSessionProtocol` owns fast Docker CLI mapping, injected failures,
+and cleanup transitions through a strict `PATH`-injected executable. The
+real-Docker `scripts/test-docker-session` harness remains the composition owner
+until each retained container invariant has a replacement contract and the
+real proof is deliberately consolidated.
+
+The canonical identity is package directory plus package clause plus top-level
+`Test`, `Benchmark`, `Fuzz`, or `TestMain` name. Nested function literals and
+subtests retain that top-level lexical owner. Methods, wrong signatures, and
+helper functions are not runnable owners; resources lexically inside helpers
+remain Small debt even when a Medium test calls the helper. Likewise, a
+`TestMain` row classifies inherited package setup but exempts only matching
+calls inside `TestMain`, never sibling tests.
+
+This bootstrap does **not** infer resources recursively through arbitrary
+helper calls or claim a complete shared-resource inventory. P0.4c currently
+covers the three `net/http/httptest` constructors that open loopback servers
+and the exact package-level `net.Listen` and `net.ListenUnixgram` constructors,
+`net.ListenConfig.Listen` on lexically identified receivers, and direct
+`syscall.Listen`. Direct `syscall.Socket`/`Bind` setup calls, typed and
+packet-specific `net` constructors, helper-backed listeners whose constructors
+live outside test source, tmux, Dolt, and other shared-host resources remain
+explicit follow-up catalogs. A Medium resource may describe a helper-backed
+runtime cost, but only syntax-owned calls in that exact runnable declaration
+leave Small-debt accounting. The `ListenConfig` matcher uses lexical Go types
+to follow same-file values, pointers, parameters, aliases, and typed factory
+results rooted in the imported `net.ListenConfig` type; it does not load
+cross-file package bodies or host toolchain export data.
+`ga-80po0c.2.2` owns the listener, tmux, Dolt, and shared-host catalogs. E1
+separately owns Large journey and provider entries.
+
+The scanner recognizes direct calls to `os/exec.Command{,Context}` and
+`time.Sleep`; package-level `net.Listen` and `net.ListenUnixgram`;
+`net.ListenConfig.Listen` on identified receivers; direct `syscall.Listen`;
+`net/http/httptest.NewServer`,
+`NewTLSServer`, and `NewUnstartedServer`; `os.Setenv`, `os.Unsetenv`,
+`os.Clearenv`, and `os.Chdir`; and
+`Setenv` or `Chdir` on function parameters typed exactly as `*testing.T` or
+`testing.TB`. It also recognizes the receiverless
+`skipSlowCmdGCTest(*testing.T, string)` definition and its same-package calls.
+An unresolved cross-file call counts only when that directory and package own
+the canonical helper. Import, parameter, and same-file helper matches use
+lexical object identity; top-level sibling declarations are indexed by
+directory and package so cross-file shadows do not masquerade as resources.
+Local shadows and wrong signatures do not count. Parenthesized call
+expressions retain the same ownership.
+
+Targeted dot imports of `net`, `os/exec`, `time`, `os`, `syscall`, `testing`,
+or `net/http/httptest` are rejected with file and import context because their
+resources cannot be attributed safely; blank imports remain harmless.
+Explicit constraints follow Go's leading-header
+rules: a pre-package `//go:build` line is effective, while a legacy
+`// +build` line must live in a leading `//` comment block separated from the
+package clause by a blank line.
+Misplaced and directive-like comments do not tag a file. An untagged scope
+means the source file has neither an effective explicit constraint nor a
+recognized `_GOOS`, `_GOARCH`, or `_GOOS_GOARCH` filename suffix. Implicit
+filename constraints use the portion before the first dot, matching Go's
+filename semantics. The code-owned platform set mirrors the Go standard
+library's [`internal/syslist.KnownOS` and `KnownArch`](https://go.dev/src/internal/syslist/syslist.go):
+the past, present, and future values Go owns for filename matching. Scanning
+does not invoke the Go tool or network. The `cmd/gc+untagged` scope additionally
+requires the source path to be beneath `cmd/gc/`.
+
+Run the focused check with:
+
+```bash
+go test -count=1 ./internal/testpolicy/resourcecensus -run '^TestRepositoryLedgerMatchesCensusAndDocumentation$'
+```
+
+The historical regex totals remain visible as point-in-time audit evidence.
+They can be higher because comments and strings matched, or lower where the old
+needle covered only `t.Setenv` or direct `os.Chdir` and the AST census now
+recognizes the full families above. Historical `cmd/gc` needles also included
+build-tagged files; the live `cmd/gc+untagged` ratchets do not.
+`internal/bdflags/freshness_test.go` is integration-tagged because it invokes
+the externally installed `bd` CLI; its process call remains visible in the
+all-source audit while staying outside untagged and Small debt.
+
+<!-- BEGIN CHECKED TEST RESOURCE LEDGER -->
+| Ledger kind | Source scope | Resource baseline | Tracking owner | Invariant / resource owner | Migration | Expiry |
+| --- | --- | --- | --- | --- | --- | --- |
+| Audit baseline | all tracked test source | fixed_sleep: 440 calls / 157 files (historical regex census: 447 / 157) | ga-80po0c.2 | tracked test source totals remain visible as audit evidence; ga-80po0c.2 owns this point-in-time source census | P0.4a | 2026-10-01 |
+| Audit baseline | all tracked test source | subprocess: 532 calls / 158 files (historical regex census: 495 / 135) | ga-80po0c.2 | tracked test source totals remain visible as audit evidence; ga-80po0c.2 owns this point-in-time source census | P0.4a | 2026-10-01 |
+| Medium owner | `cmd/gc` package `main` | TestMain: environment | ga-80po0c.2.1 | cmd/gc TestMain is the checked package-level Medium owner; only environment calls lexically inside TestMain leave Small debt | P0.4b | 2026-10-01 |
+| Medium owner | `internal/api` package `api` | TestEveryEmittedErrorCodeIsRegistered: subprocess | ga-80po0c.2.1 | internal/api tracked-source error URN guard is a checked Medium owner; only the git ls-files call lexically inside TestEveryEmittedErrorCodeIsRegistered leaves Small debt | P0.4b | 2026-10-01 |
+| Medium owner | `scripts` package `scripts_test` | TestDockerSessionProtocol: subprocess | ga-80po0c.23.1 | Docker session adapter protocol proof is a checked Medium owner; the one adapter subprocess is confined to TestDockerSessionProtocol and Docker itself is a strict PATH-injected fake | W6 | 2026-10-01 |
+| Medium owner | `scripts` package `scripts_test` | TestProviderOverridesAndSuiteContractsCrossMakeIsolation: subprocess | ga-80po0c.2.1 | Make/provider and suite-contract proof is a checked Medium owner; the six isolated Make invocations are confined to TestProviderOverridesAndSuiteContractsCrossMakeIsolation | P0.1 | 2026-10-01 |
+| Small debt ratchet | `cmd/gc` untagged test source | cwd: 285 calls / 43 files (historical regex census: 284 / 43) | ga-80po0c.2.1 | untagged Small cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners restore or eliminate every cwd mutation | D5/D6 | 2026-10-01 |
+| Small debt ratchet | `cmd/gc` untagged test source | environment: 4344 calls / 203 files (historical regex census: 4348 / 200) | ga-80po0c.2.1 | untagged Small cmd/gc environment call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners restore or eliminate every process-environment mutation | D5/D6/E6 | 2026-10-01 |
+| Small debt ratchet | `cmd/gc` untagged test source | slow_process_gate: 74 calls / 25 files (historical regex census: 75 / 25) | ga-80po0c.2.1 | untagged Small cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline; each non-Medium marked caller retains an explicit process-suite migration owner | D5/D6/E6 | 2026-10-01 |
+| Small debt ratchet | all untagged test source | fixed_sleep: 286 calls / 112 files (historical regex census: 287 / 113) | ga-80po0c.2.1 | untagged Small fixed-sleep call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners replace elapsed wall time with lifecycle signals | W1-W5 | 2026-10-01 |
+| Small debt ratchet | all untagged test source | http_test_server: 318 calls / 67 files (historical regex census: 300 / 66) | ga-80po0c.2.2 | untagged Small HTTP test server call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners move server-backed tests to exact Medium ownership or replace the listener | P0.4c | 2026-10-01 |
+| Small debt ratchet | all untagged test source | net_listen: 92 calls / 34 files | ga-80po0c.2.2 | untagged Small net.Listen call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners move listener-backed tests to exact Medium ownership or replace the listener | P0.4c | 2026-10-01 |
+| Small debt ratchet | all untagged test source | net_listen_config: 1 calls / 1 files | ga-80po0c.2.2 | untagged Small net.ListenConfig.Listen call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners move ListenConfig-backed tests to exact Medium ownership or replace the listener | P0.4c | 2026-10-01 |
+| Small debt ratchet | all untagged test source | net_listen_unixgram: 3 calls / 2 files | ga-80po0c.2.2 | untagged Small net.ListenUnixgram call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners move Unix datagram listener-backed tests to exact Medium ownership or replace the listener | P0.4c | 2026-10-01 |
+| Small debt ratchet | all untagged test source | subprocess: 402 calls / 109 files (historical regex census: 394 / 105) | ga-80po0c.2.1 | untagged Small subprocess call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners remove or replace each process call site | D1/D2/D5/D6/E6 | 2026-10-01 |
+| Small debt ratchet | all untagged test source | syscall_listen: 1 calls / 1 files | ga-80po0c.2.2 | untagged Small syscall.Listen call/file totals cannot grow; reductions must lower this baseline; non-Medium lexical owners move syscall-backed listener tests to exact Medium ownership or replace the listener | P0.4c | 2026-10-01 |
+| Source debt ratchet | `cmd/gc` untagged test source | cwd: 285 calls / 43 files (historical regex census: 98 / 13) | ga-80po0c.2.3 | untagged cmd/gc cwd call/file totals cannot grow; reductions must lower this baseline; cmd/gc callers restore or eliminate every recognized cwd mutation | D5/D6 | 2026-10-01 |
+| Source debt ratchet | `cmd/gc` untagged test source | environment: 4350 calls / 203 files (historical regex census: 3960 / 184) | ga-80po0c.2.3 | untagged cmd/gc environment call/file totals cannot grow; reductions must lower this baseline; cmd/gc callers restore or eliminate every recognized process-environment mutation | D5/D6/E6 | 2026-10-01 |
+| Source debt ratchet | `cmd/gc` untagged test source | slow_process_gate: 74 calls / 25 files (historical regex census: 78 / 27) | ga-80po0c.2.3 | untagged cmd/gc slow-process marker totals cannot grow; reductions must lower this baseline; the helper definition and every marked caller retain an explicit process-suite migration owner | D5/D6/E6 | 2026-10-01 |
+| Source debt ratchet | all untagged test source | fixed_sleep: 286 calls / 112 files (historical regex census: 295 / 114) | ga-80po0c.2 | untagged fixed-sleep call/file totals cannot grow; reductions must lower this baseline; each owning test replaces elapsed wall time with its lifecycle signal | W1-W5 | 2026-10-01 |
+| Source debt ratchet | all untagged test source | http_test_server: 318 calls / 67 files (historical regex census: 255 / 56) | ga-80po0c.2.2 | untagged HTTP test server call/file totals cannot grow; reductions must lower this baseline; each owning test closes its loopback server and removes duplicate server-backed coverage | P0.4c | 2026-10-01 |
+| Source debt ratchet | all untagged test source | net_listen: 92 calls / 34 files | ga-80po0c.2.2 | untagged net.Listen call/file totals cannot grow; reductions must lower this baseline; each owning test closes its listener and removes duplicate listener-backed coverage | P0.4c | 2026-10-01 |
+| Source debt ratchet | all untagged test source | net_listen_config: 1 calls / 1 files | ga-80po0c.2.2 | untagged net.ListenConfig.Listen call/file totals cannot grow; reductions must lower this baseline; each owning test closes its configured listener and removes duplicate listener-backed coverage | P0.4c | 2026-10-01 |
+| Source debt ratchet | all untagged test source | net_listen_unixgram: 3 calls / 2 files | ga-80po0c.2.2 | untagged net.ListenUnixgram call/file totals cannot grow; reductions must lower this baseline; each owning test closes its Unix datagram listener and removes duplicate listener-backed coverage | P0.4c | 2026-10-01 |
+| Source debt ratchet | all untagged test source | subprocess: 405 calls / 111 files (historical regex census: 380 / 98) | ga-80po0c.2 | untagged subprocess call/file totals cannot grow; reductions must lower this baseline; each process-owning test removes or replaces its source call site | D1/D2/D5/D6/E6 | 2026-10-01 |
+| Source debt ratchet | all untagged test source | syscall_listen: 1 calls / 1 files | ga-80po0c.2.2 | untagged syscall.Listen call/file totals cannot grow; reductions must lower this baseline; each owning test closes its listening file descriptor and removes duplicate listener-backed coverage | P0.4c | 2026-10-01 |
+
+| Reviewed hermetic body | Effective runnable size | Medium reason | Retained real composition owner |
+| --- | --- | --- | --- |
+| `cmd/gc` package `main` — TestDoMailInbox_RendersMessagesFromReader | medium | package TestMain mutates process state | `cmd/gc` package `main` — TestCmdMailInbox_ManagedExecLifecycleProviderReadsInbox |
+| `cmd/gc` package `main` — TestDoSessionWait_RegistersReadyWaitForRigDependency | medium | package TestMain mutates process state | `cmd/gc` package `main` — TestCmdSessionWait_AllowsRigDependencyBeads |
+| `cmd/gc` package `main` — TestDoSessionWake_PokesManagedControllerAfterStateChange | medium | package TestMain mutates process state | `cmd/gc` package `main` — TestCmdSessionWake_PokesManagedControllerAndRequestsSuspendedStart |
+| `cmd/gc` package `main` — TestPrepareWaitWakeState_ResolvesRigDependencyBeads | medium | package TestMain mutates process state | `cmd/gc` package `main` — TestCmdSessionWait_AllowsRigDependencyBeads |
+<!-- END CHECKED TEST RESOURCE LEDGER -->
+
 ## Three tiers, clear boundaries
 
 ### 1. Unit tests (`*_test.go` next to the code)
@@ -70,7 +240,10 @@ make test-integration-shards-parallel
 make test-local-full-parallel
 ```
 
-On large local machines, tune parallelism explicitly:
+By default, the local runners bound concurrency by both detected CPUs and
+available memory, budgeting 4 GiB per job and capping automatic fan-out at 16.
+If memory cannot be detected, they use three jobs. An explicit override always
+wins:
 
 ```bash
 LOCAL_TEST_JOBS=48 CMD_GC_PROCESS_TOTAL=12 make test-local-full-parallel
@@ -101,6 +274,248 @@ GC_FAST_UNIT=0 ./scripts/test-integration-shard packages-cmd-gc-3-of-6
 Raw `go test` is still appropriate for a focused package or a single failing
 test. Do not use it as the default for full local sweeps when a sharded target
 exists.
+
+#### PR static-check scope
+
+The `preflight-static` job has two fail-safe scopes. Only an effective
+`pull_request` event whose default checkout is validated as GitHub's two-parent
+synthetic merge, with its first parent equal to the event's exact base SHA, may
+use the changed scope. The checkout keeps the default `GITHUB_SHA` and uses
+`fetch-depth: 2` so that validation is local and exact. A missing or different
+base, a non-merge checkout, or an unknown event selects the full scope.
+
+Pushes to `main`, schedules, manual dispatches, and every other non-PR event run
+the full static suite. Reusable workflows inherit their caller's event; the
+reusable call itself grants no changed-scope exemption. An effective
+`pull_request` event may still qualify after the same synthetic-merge
+validation, while an invocation such as the current RC `workflow_dispatch`
+remains full. The classifier never guesses a base from `origin/main` or a
+merge-base calculation.
+
+Even a validated PR merge runs the full scope when its diff touches static
+analysis or build policy:
+
+- `go.mod`, `go.sum`, `go.work`, or `go.work.sum`
+- any root `.golangci.*` configuration or `Makefile`
+- `.github/workflows/**`, `.github/actions/**`, or `.githooks/**`
+- `vendor/**` or `scripts/cipolicy/**`
+- `scripts/ci-static-scope` and `scripts/ci-static-select`
+
+The two scopes own different commands:
+
+| Scope | Commands | Selection guarantee |
+| --- | --- | --- |
+| Changed PR | `make lint-affected`, `make fmt-check-changed` | Lint and vet every package owning a changed Go build input or embedded file, every native package that could consume a changed path, and all transitive reverse dependents; format-check only changed regular `.go` files that still exist. |
+| Full/fail-safe | `make lint`, `make fmt-check`, `make vet` | Analyze and format-check the whole repository, then run standalone `go vet ./...`. |
+
+Affected-package discovery examines every changed path. It selects packages
+for changed Go-tool build inputs (`.go`, `.c`, `.cc`, `.cpp`, `.cxx`, `.m`,
+`.h`, `.hh`, `.hpp`, `.hxx`, `.f`, `.F`, `.for`, `.f90`, `.s`, `.S`, `.sx`,
+`.swig`, `.swigcxx`, and `.syso`) and maps changed embedded files to every
+owning package using `EmbedFiles`, `TestEmbedFiles`, and `XTestEmbedFiles` from
+the canonical records in one complete
+`go list -mod=readonly -test -json ./...` graph.
+Additions, modifications, deletions, and both sides of cross-package moves are
+included. Git rename coalescing is disabled so a move cannot hide the old
+package. Native compiler include and linker inputs can have recognized or
+arbitrary names and may live outside their consuming package. Every changed
+path therefore selects every package with native Go-tool sources, plus their
+reverse dependents. This is the smallest sound scope available without trying
+to duplicate compiler-specific dependency discovery. An unrelated non-build,
+non-embedded path remains a no-op when the graph has no native package that
+could consume it.
+
+Reverse dependents are included because analyzers such as `govet` consume
+exported facts, including through test-only imports. If the package graph
+cannot be loaded completely, affected lint fails safe to `./...` instead of
+trusting a partial graph. This includes a deleted required embed input. A
+deleted glob member no longer appears in the current resolved embed inventory,
+so a deletion that may match any current `EmbedPatterns`, `TestEmbedPatterns`,
+or `XTestEmbedPatterns` entry fails safe even when a nested package still owns
+the deleted build-input directory. Any other deletion beneath a package that
+has neither a current embed owner nor a current direct package owner also fails
+safe to full scope. These guards run before native shared-input shortcuts,
+including for recognized headers. File selection is NUL-delimited. Formatting
+remains limited to
+changed `.go` paths, excludes deletions and symlinks, accepts only existing
+regular files, and never invokes the formatter with an empty file list.
+
+`lint-affected` is the conservative PR target. It runs the configured
+golangci linters, including golangci's `govet`, then runs the Go tool's `vet`
+over the exact same affected package closure. The bounded duplicate preserves
+both tools' distinct diagnostics without repeating either analysis across the
+whole repository. It also retains standalone-vet diagnostics in generated
+files and unchanged reverse dependents. If selection fails, the same pair runs
+over `./...`; fallback never disables configured linters. `lint-changed`
+remains the faster local/pre-commit target and intentionally checks only
+packages that contain changed Go files. Both accept `LINT_CHANGED_SCOPE` and
+`LINT_CHANGED_REF`; CI uses `tracked` and the event's exact PR base SHA.
+
+The golangci configuration enables `govet` explicitly in both scopes.
+Golangci's `govet` execution is not assumed to be semantically equivalent to
+standalone `go vet`: generated-file exclusions and analyzer/configuration drift
+can differ. Full-scope runs therefore retain standalone `go vet ./...`, while
+the changed lane invokes standalone vet on its conservative closure.
+
+`make test-ci-policy` runs independently of changed/full static selection and
+always executes the focused workflow-scope, golangci-`govet`, affected-target,
+and fail-closed-classifier contracts. A self-binding test in the existing CI
+policy package rejects any Makefile change that removes this focused Go suite
+from the target.
+
+#### Historical timing summaries
+
+The opt-in timing artifacts produced by `scripts/go-test-observable` can be
+aggregated offline across caller-curated successful `main` push runs:
+
+```bash
+go run ./scripts/test-timing-summary.go /path/to/downloaded-artifacts \
+  >> "$GITHUB_STEP_SUMMARY"
+```
+
+Use the same strict parser to emit the versioned machine-readable history
+snapshot:
+
+```bash
+go run ./scripts/test-timing-summary.go --format=json \
+  /path/to/downloaded-artifacts > timing-history-v1.json
+```
+
+The summarizer recursively reads schema-v1 JSON artifacts, deduplicates
+identical downloads, and rejects conflicting artifacts with the same workflow,
+run, attempt, job, shard, and variant identity. It emits the ten slowest
+top-level tests by observed p95 and the ten highest-variance top-level tests
+for each comparable `(job, variant, runner label, OS, architecture, CPU count)`
+profile. Ephemeral runner names do not split profiles. Package terminal rows
+are shard totals rather than independently scheduled work, and nested subtests
+are diagnostic until the shard manifest explicitly promotes them, so neither
+is ranked. Statistics use successful durations only while retaining failure
+and skip counts. Percentiles use the empirical nearest-rank method, variance
+is population variance in seconds squared, and samples are not trimmed.
+
+The JSON snapshot groups units by that same comparable profile and preserves
+every successful observation with its exact artifact identity and tested SHA.
+Profiles and units have canonical ordering. Observations compare the raw string
+tuple `(workflow, run_id, run_attempt, job, shard_id, variant)` lexically, then
+tested SHA and duration; run IDs and attempts are opaque strings, so `002`,
+`10`, and `2` remain distinct and sort in that order. Identical artifact
+downloads increment `duplicate_artifact_count` without duplicating samples.
+Units that have only failed or skipped remain present with empty successful
+observations and `null` statistics. `p75_authoritative` becomes true at five
+successful samples and `p95_authoritative` at twenty. `last_success_sha` is the
+SHA of the final successful observation in canonical artifact-identity order;
+schema v1 has no trustworthy timestamp, so this field is deterministic but not
+a claim about chronological recency.
+
+Timing artifact schema v1 does not record the event, ref, or workflow
+conclusion, so the tool
+cannot prove protected-branch provenance. The caller must supply artifacts
+from successful `main` push runs. The JSON snapshot is workflow-neutral input,
+not a protected store or planner decision. An observed p75 with fewer than five
+successful samples and p95 with fewer than twenty are diagnostic, not
+planner-authoritative. The seven-day artifact retention window is not a
+protected historical timing database, and this one-shot builder does not prune
+observations. Renamed tests remain separate histories.
+
+The storage-boundary mutation mode persists caller-authenticated cohorts
+without merging report snapshots:
+
+```bash
+go run ./scripts/test-timing-summary.go \
+  --update-history timing-history-db-v1.json \
+  --run-envelope trusted-run-v1.json \
+  --retain-runs 50 \
+  --format=json \
+  /path/to/this-run-artifacts > timing-history-v1.json
+```
+
+All three mutation flags are required together, and retention has no hidden
+default. The versioned run envelope names the repository, event, ref, workflow,
+run ID, run attempt, tested SHA, conclusion, and RFC3339 completion time. The
+database stores each envelope and artifact once, then stores normalized
+pass/fail/skip samples by artifact reference. Replaying identical artifacts is
+therefore a byte-for-byte no-op; conflicting copies or envelope metadata fail
+before the existing database changes. Retention removes whole oldest cohorts
+by parsed completion time and recomputes snapshot statistics and the 5/20
+authority thresholds from the retained evidence. Publication uses a synced
+temporary sibling and atomic rename.
+
+This command validates envelope shape and checks each timing artifact's
+`workflow`, `run_id`, `run_attempt`, and `tested_sha` against it. It does not
+authenticate who supplied the envelope, prove that the cohort contains every
+expected shard, serialize multiple writers, publish `ci-metrics`, or make the
+result planner-authoritative. Those are responsibilities of the later trusted
+default-branch workflow. Until that workflow lands, use the database as
+deterministic storage-boundary evidence only.
+
+#### Local timing-plan dry runs
+
+The local planner consumes the current runnable inventory, the canonical
+schema-v1 timing snapshot above, and planner configuration without changing
+the active shard topology:
+
+```bash
+go run ./scripts/test-timing-plan.go \
+  --inventory runnable-inventory-v1.json \
+  --history timing-history-v1.json \
+  --config timing-plan-config-v1.json \
+  > timing-plan-v1.json
+```
+
+Inventory and configuration are independently versioned. The minimal inventory
+is `{"schema":1,"units":[{"unit_id":"package:TestName"}]}`. Configuration
+schema v1 supplies one exact comparable profile, a shard count, a p95 cap, and
+shared conservative fallback estimates for that suite/profile invocation. The
+profile key is the complete `(job, variant, runner label, OS, architecture,
+CPU count)` tuple; profiles are never merged or selected by a nearest-runner
+heuristic. All three inputs reject missing or unsupported schemas, unknown
+fields, trailing JSON values, and `null` where a contractual array is required.
+
+The current inventory is the only authority for runnable membership. Every
+inventory unit is assigned exactly once, and stale timing rows cannot add work.
+An exact profile match contributes history. If the requested profile is absent,
+the command still produces a complete static plan and records
+`history_profile_status: "profile-missing"`; multiple copies of one comparable
+profile are malformed and fail. Snapshot counts, identities, nullable
+statistics, observations, and authority flags are validated before planning,
+including rows for units no longer in the inventory.
+
+History becomes planner-usable in two stages:
+
+- Before five successful samples, p50, p75, and variance use the configured
+  static fallback. At five samples, the empirical values become usable.
+- Before twenty successful samples, p95 is
+  `max(static_p95, 1.5 * selected_p75)`. At twenty samples, empirical p95
+  becomes usable.
+
+Units are sorted deterministically by descending p75, p95, variance, and p50,
+then stable unit ID, and placed in the shortest p75 shard that remains within
+the aggregate p95 cap. No unit is dropped: an individually oversized unit is
+marked `p95-cap-exceeded`, while unavoidable aggregate overflow is marked
+`shard-p95-cap-exceeded`. Equivalent shuffled inputs therefore emit identical
+canonical JSON.
+
+The output is explicitly marked `authority: "dry-run"`. This command reads only
+the three named files and writes the plan to stdout. It does not read GitHub
+state, authenticate protected provenance, write timing history, publish
+`ci-metrics`, perform path gating or hysteresis, decide required lanes, or
+activate workflow/shard execution. Those remain deferred to the trusted
+control-plane workflow.
+
+In timing artifact schema v1, `commit_sha` is the exact Git revision checked out and tested
+(`GITHUB_SHA`). On `pull_request` runs, GitHub sets it to the synthetic merge
+commit, not the contributor branch head. Consumers must not interpret it as
+source/head identity. A future schema that needs both identities must add
+distinct `tested_sha` and `source_sha` fields; schema v1 must not be
+reinterpreted.
+
+Tier A command acceptance and external-provider compatibility are separate
+gates. `make test-acceptance` uses controlled subprocess and file providers; it
+does not require inference or a `bd` executable. `make test-bd-cli-contract`
+runs the four version-sensitive `bd` CLI contracts under the dedicated
+`acceptance_bd_contract` build tag. CI applies that focused manifest to the
+minimum-supported, current, and main-HEAD `bd` versions without repeating the
+unrelated Tier A flows.
 
 #### Resource isolation via gascity-test.slice
 
@@ -234,6 +649,63 @@ coherence, and end-to-end provider wiring. Do not put low-level edge cases
 here. Corrupt files, exact parser failures, request validation branches, and
 single handler error cases belong in unit tests next to the implementation.
 
+#### Dashboard serve-level projection tests (`test/dashport`)
+
+`test/dashport` is the Go serve-level (Layer A) e2e for the dashboard. It stands
+up the real supervisor stack — the typed `/v0` API, the host-side `/api` plane,
+and the embedded SPA — over a **seeded event log + bead store** via the exported
+`api.ServeSeededCity` seam, then drives the exact endpoints each dashboard view
+consumes and asserts the projected JSON. It is the layer that catches the
+run-view class of regression: a projection break is visible at the Go wire level
+here even when every request still returns 200.
+
+The anchor test (`TestAnchorRunProjection`) seeds one run two ways from a single
+`testdata/dashport/` corpus — as a store-resident graph.v2 molecule (the
+`/workflow/{id}` read) **and** as a `bead.*` event stream in
+`<cityPath>/.gc/events.jsonl` (the runproj-backed `/api/city/{c}/runs/summary`
+and `/runs/{id}/detail` routes) — and asserts the run is present and non-empty on
+both paths. Responses decode into the generated Go wire types
+(`internal/api/genclient`) and the `internal/runproj` projection structs, never
+`map[string]any`, so a wire-shape drift fails compilation.
+
+Run it in isolation with `make dashboard-e2e-go`
+(`go test -tags integration ./test/dashport/...`). It is a Tier 3 integration
+package: the CI `packages` integration shard (`go list ./...` under
+`scripts/test-integration-shard packages`, invoked by
+`make test-integration-shards-parallel`) picks it up automatically alongside the
+REST/formula shards — no dedicated shard registration is needed. The
+structured-transcript view is not covered here; it lands with its serving path
+(PR #3931) and is asserted then.
+
+#### Dashboard Playwright render smoke (`internal/api/dashboardspa/web/frontend/e2e`)
+
+Layer B is a Chromium render smoke over the **same** `testdata/dashport/` corpus,
+loaded through the same importable loader (`test/dashport/corpus`) that Layer A
+uses — one fixture source of truth. A small `//go:build integration` binary,
+`test/dashport/cmd/fakesupervisor`, serves the seeded stack via
+`api.ServeSeededCity` on a loopback listener; the Playwright `webServer` launches
+it and points `baseURL` at it, so the SPA and its same-origin `/v0` + `/api`
+surfaces are hosted by one handler (no CORS or base-URL override). Each spec
+drives a route (Home, Runs, the seeded run detail — the regression view —,
+Agents, Beads, Mail, Activity, Health) and asserts three things: the seeded
+content renders, **no** React error boundary
+(`components/ErrorBoundary.tsx`) is shown, and **no** client-error POST
+(`/api/client-errors`) fires. It removes all vitest mocks — the built bundle runs
+in a real browser against a real HTTP supervisor, so it exercises the full
+fetch → generated client → projection helper → render path.
+
+It is a **Tier 3** browser tier — it needs a built SPA bundle + Chromium, so it
+is NOT in the Go integration shard set. Run it with `make dashboard-e2e-play`
+(builds the SPA, builds the fakesupervisor with `-tags integration`, installs
+Chromium via `npx playwright install --with-deps chromium`, then runs the specs);
+`make dashboard-e2e` runs both layers. In CI it runs as appended steps in the
+existing **`dashboard`** job (`.github/workflows/ci.yml`), which already has Go +
+Node provisioned; a `playwright-report` artifact is uploaded on failure. Add new
+routes/assertions by editing `e2e/render-smoke.spec.ts`; keep
+`e2e/fixtures/expected.ts` aligned **manually** with the exported constants in
+`test/dashport/corpus/corpus.go` (there is no automated parity check — the two
+are kept in sync by convention).
+
 #### Live worker inference tests (`//go:build acceptance_c`)
 
 `test/acceptance/worker_inference` runs live Claude/Codex/Gemini/OpenCode CLI
@@ -359,22 +831,114 @@ if !strings.HasPrefix(ops[0], "ensure-ready") {
 | Does the session provider start a session correctly? | Conformance |
 | Does `gc stop` shut down beads after agents? | Coordination |
 
-**The overtesting line:** don't re-verify contracts that conformance tests
-already cover. Coordination tests check call ordering and argument plumbing,
-not that individual operations produce correct results.
+**The overtesting line:** don't re-verify contracts that an executable
+constructor-bound conformance proof already covers. Coordination tests check
+call ordering and argument plumbing, not that individual operations produce
+correct results.
 
 ### Conformance testing
 
-Every provider interface has a conformance test suite that validates the
-contract against all implementations. These live in `*test/conformance.go`
-packages and are imported by each implementation's test file:
+Provider interfaces may expose shared conformance suites in
+`*test/conformance.go` packages. Suite availability does not prove that every
+implementation or production constructor executes the suite: each consumer
+must bind its exact constructor without a pre-run skip. The table names the
+shared suites and their current named consumers; the runtime ledger below is
+the constructor-specific source of truth.
 
-| Interface | Conformance suite | Implementations tested |
+| Interface | Conformance suite | Current named consumers |
 |---|---|---|
 | `beads.Store` | `internal/beads/beadstest/conformance.go` | MemStore, FileStore, BdStore |
-| `runtime.Provider` | `internal/runtime/runtimetest/conformance.go` | Fake, tmux, subprocess, exec, k8s |
+| `runtime.Provider` | `internal/runtime/runtimetest/conformance.go` | See the checked runtime ledger below |
 | `mail.Provider` | `internal/mail/mailtest/conformance.go` | beadmail, exec |
 | `events.Recorder` | `internal/events/eventstest/conformance.go` | FileRecorder, exec |
+| `fsys.FS` | `internal/fsys/fsystest/conformance.go` | OSFS, Fake |
+
+The `fsys.FS` suite currently proves the portable namespace core: parent and
+file/directory collisions, regular-file copying and modes, `ReadDir` errors,
+file and directory-tree rename, empty/non-empty removal, and chmod. Symlink
+resolution/replacement, atomic-write composition, and operation-scoped fault
+and recording decorators remain follow-up contract slices; do not delete their
+OS-backed coverage based on the namespace suite alone.
+
+Builtin runtime production compositions are source-bound to `cmd/gc`'s
+registry, their constructor-specific contract dispositions, and the table
+below. The auto composition lives outside that registry and is bound to the
+exact production function and `runtime/auto.New` result it returns. A waiver is
+a visible contract gap, not evidence that conformance passes.
+
+A proved row names one runnable test whose final top-level statement invokes
+the declared shared contract with an inline factory. The source guard requires
+that factory to return the row's exact constructor directly, rejects pre-run
+helper gates and direct skip syntax, and permits only named testing operations
+plus explicitly ledgered setup functions. E1 separately proves that
+build-tagged rows execute in their required CI lane; a source-bound proof does
+not claim cadence ownership by itself.
+
+Reusable-double discovery is intentionally bounded, not repository-wide. The
+designated boundary is `internal/runtime/fake.go` for the `runtime.Provider`
+port. The guard type-checks its declared runtime type context, discovers every
+exported concrete type in that file whose value or pointer implements
+`runtime.Provider`, and scans the package's buildable non-test files for each
+exported receiverless function whose first result itself implements
+`runtime.Provider` and resolves to that exact type, either as the value or its
+pointer. Constructors may return additional results such as `error`; function
+bodies are outside the source guard. A value-returning constructor counts only
+when the value method set implements the port. The current surface is
+`runtime.Fake` through `runtime.NewFake` and `runtime.NewFailFake`. Aliases do
+not create a second double type and collapse to their tracked concrete type; an
+exported provider alias that exposes an otherwise-untracked type fails closed.
+Caller-local types, methods, unexported helpers, and provider types declared in
+other files are outside this boundary. An exported generic concrete type in the
+boundary fails closed because an uninstantiated generic has no single provider
+method set to inventory.
+
+Other reusable-support boundaries remain explicit follow-up work:
+`beadstest.RecordingStore`, the events and mail fakes, `fsys.Fake`, and
+`clock.Fake` are not claimed by this table.
+
+The hybrid row deliberately chooses `cmd/gc.newHybridProvider` as its
+construction boundary because that is the wrapper returned directly by the
+runtime registry. This ledger does not recursively claim the wrapper's internal
+tmux, K8s, or hybrid constructors.
+
+`runtime.NewFake`, `auto.New`, `subprocess.NewSeamBackedWithDir`, and
+`acp.NewSeamBackedWithDir` are source-bound to the shared runtime contract
+below. The auto proof runs the exact production composition once with two
+fresh in-memory fakes and owns no subprocess or listener; focused auto tests
+retain base-versus-ACP routing and optional-capability coverage instead of
+duplicating the full suite for each route. The seam-backed proofs are the only
+full subprocess and ACP runtime contracts: the duplicate raw subprocess
+invocation is removed, and the existing ACP owner is converted in place so its
+fake server is still built once. Focused raw provider and seam tests remain for
+both packages, including legacy overlap that later consolidation may remove
+case by case. The default subprocess constructor remains a separate H5-owned
+gap because its reachable empty-city-path branch uses shared temporary state.
+The default ACP constructor is also an H5-owned gap because it always uses shared
+`os.TempDir()/gc-acp` state. E1 (`ga-80po0c.6`) owns the Large provider/E2E
+manifest and required lane/cadence execution; it does not own
+constructor-to-contract source binding.
+
+<!-- BEGIN CHECKED RUNTIME PROVIDER LEDGER -->
+This table is rendered from `internal/testutil/providerledger` and checked by `go test ./internal/testutil/providerledger`; edit the Go ledger, then use the expected block printed on drift.
+
+| Provider path | Roles | Reusable type | Port | Constructor | Discovery | Contract | Status |
+|---|---|---|---|---|---|---|---|
+| `runtime.builtin.acp` | production_provider | — | `runtime.Provider` | `internal/runtime/acp.NewSeamBacked` | runtime.builtin/exact:acp | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: NewSeamBacked always uses shared os.TempDir()/gc-acp state; the WithDir proof does not exercise that composition |
+| `runtime.builtin.acp` | production_provider | — | `runtime.Provider` | `internal/runtime/acp.NewSeamBackedWithDir` | runtime.builtin/exact:acp | `runtime.Provider` | proved by internal/runtime/acp/conformance_test.go#TestACPConformance |
+| `runtime.builtin.exec` | production_provider | — | `runtime.Provider` | `internal/runtime/exec.NewSeamBacked` | runtime.builtin/prefix:exec: | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: full conformance covers the raw exec provider, not the production seam-backed prefix composition |
+| `runtime.builtin.exec` | production_provider | — | `runtime.Provider` | `internal/runtime/t3bridge.NewSeamBacked` | runtime.builtin/prefix:exec: | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the legacy gc-session-t3 prefix branch selects the T3 bridge composition, which has no full shared runtime contract |
+| `runtime.builtin.fail` | production_provider, reusable_double | `internal/runtime.Fake` | `runtime.Provider` | `internal/runtime.NewFailFake` | runtime.builtin/exact:fail; reusable: internal/runtime/fake.go | `runtime.Provider` | not applicable: intentional faulting double: a successful lifecycle cannot be exercised, so the successful-provider contract is not applicable |
+| `runtime.builtin.fake` | production_provider, reusable_double | `internal/runtime.Fake` | `runtime.Provider` | `internal/runtime.NewFake` | runtime.builtin/exact:fake; reusable: internal/runtime/fake.go | `runtime.Provider` | proved by internal/runtime/fake_conformance_test.go#TestFakeConformance |
+| `runtime.builtin.herdr` | production_provider | — | `runtime.Provider` | `internal/runtime/herdr.New` | runtime.builtin/exact:herdr | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the existing full conformance run skips in short mode or when the herdr executable is absent |
+| `runtime.builtin.hybrid` | production_provider | — | `runtime.Provider` | `cmd/gc.newHybridProvider` | runtime.builtin/exact:hybrid | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: cmd/gc.newHybridProvider is the selected registry construction boundary; its internal tmux, K8s, and hybrid constructors are not claimed here, and the wrapper has no full shared runtime contract |
+| `runtime.builtin.k8s` | production_provider | — | `runtime.Provider` | `internal/runtime/k8s.NewSeamBacked` | runtime.builtin/exact:k8s | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the actual K8s production composition has no full shared runtime contract |
+| `runtime.builtin.ssh` | production_provider | — | `runtime.Provider` | `internal/runtime/ssh.NewSeamBacked` | runtime.builtin/prefix:ssh: | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the production SSH composition has no full shared runtime contract |
+| `runtime.builtin.subprocess` | production_provider | — | `runtime.Provider` | `internal/runtime/subprocess.NewSeamBacked` | runtime.builtin/exact:subprocess | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: NewSeamBacked selects a distinct reachable empty-cityPath branch with shared /tmp state; the WithDir proof does not exercise that composition |
+| `runtime.builtin.subprocess` | production_provider | — | `runtime.Provider` | `internal/runtime/subprocess.NewSeamBackedWithDir` | runtime.builtin/exact:subprocess | `runtime.Provider` | proved by internal/runtime/subprocess/seam_conformance_test.go#TestSubprocessSeamConformance |
+| `runtime.builtin.t3bridge` | production_provider | — | `runtime.Provider` | `internal/runtime/t3bridge.NewSeamBacked` | runtime.builtin/exact:t3bridge | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the production T3 bridge composition has focused tests but no full shared runtime contract |
+| `runtime.builtin.tmux` | production_provider | — | `runtime.Provider` | `internal/runtime/tmux.NewSeamBackedWithConfig` | runtime.builtin/exact:tmux | `runtime.Provider` | waived by ga-80po0c.3 through 2026-08-12: the existing full conformance run skips when the tmux executable is absent |
+| `runtime.composition.auto` | production_provider | — | `runtime.Provider` | `internal/runtime/auto.New` | source: cmd/gc/providers.go#resolveSessionTransportProvider — conditional transport composition is outside the runtime registry | `runtime.Provider` | proved by internal/runtime/auto/conformance_test.go#TestAutoConformance (default-route conformance; ACP route covered by focused auto routing tests) |
+<!-- END CHECKED RUNTIME PROVIDER LEDGER -->
 
 Conformance tests verify the behavioral contract (create/read/update/delete,
 error handling, concurrency). They deliberately don't test lifecycle ordering
@@ -392,7 +956,7 @@ test coverage. This table is the checklist for new provider implementations.
 
 | Seam | Implementations | Lifecycle deps | Coordination tested? |
 |---|---|---|---|
-| **Runtime** (`runtime.Provider`) | tmux, exec, k8s, fake | None (stateless start/stop) | Via lifecycle start order test |
+| **Runtime** (`runtime.Provider`) | See checked runtime ledger above | None (stateless start/stop) | Via lifecycle start order test |
 | **Beads** (`beads.Store`) | MemStore, FileStore, BdStore | ensure-ready → init → hooks | `TestLifecycleCoordination_*` |
 | **Mail** (`mail.Provider`) | beadmail, exec | Depends on beads store | No — not a lifecycle seam; conformance sufficient |
 | **Events** (`events.Recorder`) | FileRecorder, exec | None (append-only) | No — stateless append, conformance sufficient |

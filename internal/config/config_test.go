@@ -5995,6 +5995,46 @@ name = "a"
 	}
 }
 
+func TestParseSessionNudgePollInterval(t *testing.T) {
+	toml := `
+[workspace]
+name = "test"
+
+[session]
+nudge_poll_interval = "15s"
+
+[[agent]]
+name = "a"
+`
+	cfg, err := Parse([]byte(toml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Session.NudgePollIntervalDuration(); got != 15*time.Second {
+		t.Errorf("NudgePollIntervalDuration() = %v, want 15s", got)
+	}
+}
+
+func TestNudgePollIntervalDurationUnsetOrInvalid(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"unset", ""},
+		{"unparseable", "banana"},
+		{"zero", "0s"},
+		{"negative", "-5s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &SessionConfig{NudgePollInterval: tc.value}
+			if got := s.NudgePollIntervalDuration(); got != 0 {
+				t.Errorf("NudgePollIntervalDuration() = %v, want 0 (unconfigured)", got)
+			}
+		})
+	}
+}
+
 func TestAPIConfigParsing(t *testing.T) {
 	toml := `
 [workspace]
@@ -7859,10 +7899,9 @@ printf 'TRACE=%%s\nARGS=%%s\n' "$GC_WORKFLOW_TRACE" "$*" > %q
 	return tracePath, args
 }
 
-// TestPreferredDeterministicControlDispatcher locks the singleton-first
-// selection both graphroute and dispatch route control beads with. The city-
-// level singleton (Dir == "") must win for every scope; a rig-scoped instance is
-// used only when no city-level deterministic dispatcher exists. Non-deterministic
+// TestPreferredDeterministicControlDispatcher locks the scope-local selection
+// shared by graphroute and dispatch. City graphs use the city dispatcher and
+// rig graphs use the dispatcher configured for that exact rig. Non-deterministic
 // control-dispatcher agents (no convoy-control StartCommand) are ignored.
 func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 	deterministic := func(dir string) Agent {
@@ -7886,25 +7925,31 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 		wantOK     bool
 	}{
 		{
-			name:       "singleton preferred over rig copy for rig scope",
+			name:       "rig copy selected for rig scope",
 			agents:     []Agent{rigCopy, citySingleton},
 			rigContext: "fixture",
-			wantQN:     "core.control-dispatcher",
+			wantQN:     "fixture/core.control-dispatcher",
 			wantOK:     true,
 		},
 		{
-			name:       "singleton preferred for empty scope",
+			name:       "city dispatcher selected for empty scope",
 			agents:     []Agent{rigCopy, citySingleton},
 			rigContext: "",
 			wantQN:     "core.control-dispatcher",
 			wantOK:     true,
 		},
 		{
-			name:       "rig-scoped fallback when no singleton",
+			name:       "rig copy selected without city dispatcher",
 			agents:     []Agent{rigCopy},
 			rigContext: "fixture",
 			wantQN:     "fixture/core.control-dispatcher",
 			wantOK:     true,
+		},
+		{
+			name:       "city dispatcher does not satisfy rig scope",
+			agents:     []Agent{citySingleton},
+			rigContext: "fixture",
+			wantOK:     false,
 		},
 		{
 			name:       "no match when only a non-deterministic dispatcher exists",
@@ -7934,6 +7979,29 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 
 	if _, ok := PreferredDeterministicControlDispatcher(nil, ""); ok {
 		t.Fatal("nil cfg should return ok=false")
+	}
+}
+
+func TestControlDispatcherForScopeSupportsExactPlainConfig(t *testing.T) {
+	cfg := &City{Agents: []Agent{
+		{Name: ControlDispatcherAgentName},
+		{Name: ControlDispatcherAgentName, Dir: "fixture"},
+	}}
+
+	for _, tt := range []struct {
+		rigContext string
+		want       string
+	}{
+		{want: ControlDispatcherAgentName},
+		{rigContext: "fixture", want: "fixture/" + ControlDispatcherAgentName},
+	} {
+		dispatcher, ok := ControlDispatcherForScope(cfg, tt.rigContext)
+		if !ok || dispatcher.QualifiedName() != tt.want {
+			t.Fatalf("ControlDispatcherForScope(%q) = (%q, %v), want (%q, true)", tt.rigContext, dispatcher.QualifiedName(), ok, tt.want)
+		}
+	}
+	if _, ok := ControlDispatcherForScope(cfg, "other"); ok {
+		t.Fatal("city dispatcher must not satisfy another rig scope")
 	}
 }
 
@@ -8094,6 +8162,53 @@ func TestCityWithProvidersInstallsKimiHooksByDefault(t *testing.T) {
 			want := []string{"kimi"}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("Workspace.InstallAgentHooks = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestDurationOr(t *testing.T) {
+	def := 30 * time.Second
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"empty falls back to default", "", def},
+		{"unparseable falls back to default", "5minutes", def},
+		{"valid parses", "2m", 2 * time.Minute},
+		{"zero parses to zero, not default", "0", 0},
+		{"negative passes through unchanged", "-5s", -5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := durationOr(tc.raw, def); got != tc.want {
+				t.Errorf("durationOr(%q, %v) = %v, want %v", tc.raw, def, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurationFloorOr(t *testing.T) {
+	const floor = ProgressStallTimeoutMinimum
+	cases := []struct {
+		name string
+		raw  string
+		def  time.Duration
+		want time.Duration
+	}{
+		{"empty returns default", "", 0, 0},
+		{"unparseable returns default", "5minutes", 0, 0},
+		{"non-positive falls back to default", "-1m", 0, 0},
+		{"explicit zero falls back to default", "0", 0, 0},
+		{"positive below floor is raised to floor", "1m", 0, floor},
+		{"at floor stays", floor.String(), 0, floor},
+		{"above floor passes through", "10m", 0, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := durationFloorOr(tc.raw, tc.def, floor); got != tc.want {
+				t.Errorf("durationFloorOr(%q, %v, %v) = %v, want %v", tc.raw, tc.def, floor, got, tc.want)
 			}
 		})
 	}

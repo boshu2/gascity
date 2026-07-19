@@ -685,65 +685,6 @@ wait_for_bd_runtime_schema() {
     return 1
 }
 
-# ensure_types_custom_in_yaml writes types.custom to .beads/config.yaml.
-# bd reads this YAML key as a fallback when the database config table is
-# unset (see beads internal/config: GetCustomTypesFromYAML), so writing
-# here registers the types without paying bd's per-command auto-migrate
-# cost (~50s on populated databases).
-#
-# Idempotent against the desired effective set: re-running with the SAME
-# baseline is a no-op. The rewrite NEVER narrows the type set: if the YAML
-# already contains pack-defined or user-defined custom types beyond $types
-# (the GC baseline), those extensions are preserved. This matches the
-# merge semantics of internal/doctor/checks_custom_types.go:mergeCustomTypes
-# and fixes the gascity-side failure surfaced in #2154 — a stale or partial
-# line is replaced with the union of existing and required entries, never
-# overwritten with just the baseline.
-ensure_types_custom_in_yaml() {
-    local dir="$1"
-    local types="$2"
-    local config_yaml="$dir/.beads/config.yaml"
-    [ -f "$config_yaml" ] || return 0
-    [ -n "$types" ] || return 0
-
-    local current
-    current=$(sed -n 's/^types\.custom: *//p' "$config_yaml" 2>/dev/null | head -1)
-
-    local merged
-    merged=$(printf '%s,%s' "$current" "$types" | awk -F, '
-        {
-            for (i = 1; i <= NF; i++) {
-                t = $i
-                sub(/^[ \t]+/, "", t)
-                sub(/[ \t]+$/, "", t)
-                gsub(/"/, "", t)
-                sub(/^[ \t]+/, "", t)
-                sub(/[ \t]+$/, "", t)
-                if (t == "") continue
-                if (!(t in seen)) {
-                    seen[t] = 1
-                    out = (out == "" ? t : out "," t)
-                }
-            }
-            print out
-        }
-    ')
-
-    # Short-circuit when the merged set already equals what's on disk:
-    # avoids mtime churn that downstream watchers might misread as a real
-    # change. Includes the case where current is already a superset of
-    # the baseline (operator/pack types appended to the GC list).
-    if [ "$current" = "$merged" ]; then
-        return 0
-    fi
-
-    local tmp
-    tmp=$(mktemp "$config_yaml.tmp.XXXXXX") || return 0
-    sed '/^types\.custom:/d' "$config_yaml" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
-    printf 'types.custom: %s\n' "$merged" >> "$tmp"
-    mv -f "$tmp" "$config_yaml" || rm -f "$tmp"
-}
-
 # --- Robustness Helpers ---
 
 # save_state writes the private provider runtime state atomically (no jq dependency).
@@ -2601,15 +2542,71 @@ doltlite_maintenance_due() {
     [ $((now - last)) -ge "$interval" ]
 }
 
+# run_doltlite_reindex rebuilds the DoltLite store's SQLite secondary indexes.
+# `bd flatten`/`bd gc` rewrite the store (like a clone/pull) and leave the
+# secondary indexes stale, so index-path reads (count/status/list) silently
+# return wrong results until a REINDEX (ga-7hei). REINDEX is SQLite-specific
+# DDL, so it must run against the physical .beads/doltlite/<db>.db file through
+# gc's in-process SQLite driver (gc dolt-config doltlite-reindex, which resolves
+# the same .db the read path opens from metadata.json). It cannot go through
+# `bd sql`: that surface speaks Dolt/MySQL and rejects REINDEX, and it is
+# refused outright in the embedded mode run_bd_doltlite forces. Best-effort and
+# non-fatal: the caller warns on non-zero exit.
+run_doltlite_reindex() {
+    local dir="$1"
+    local gc_bin
+    gc_bin=$(resolve_gc_helper_bin)
+    if [ -z "$gc_bin" ]; then
+        return 1
+    fi
+    "$gc_bin" dolt-config doltlite-reindex --dir "$dir"
+}
+
+# doltlite_reindex_supported reports whether the resolved gc helper can rebuild
+# the DoltLite SQLite indexes in process. Only a gc built with the native beads
+# SQLite driver can (gc dolt-config doltlite-reindex --check); a default build
+# returns non-zero. The maintenance path probes this BEFORE the stale-index-
+# producing flatten/gc so it never creates index corruption it cannot heal
+# (ga-7hei).
+doltlite_reindex_supported() {
+    local dir="$1"
+    local gc_bin
+    gc_bin=$(resolve_gc_helper_bin)
+    if [ -z "$gc_bin" ]; then
+        return 1
+    fi
+    "$gc_bin" dolt-config doltlite-reindex --dir "$dir" --check >/dev/null 2>&1
+}
+
 run_doltlite_existing_db_maintenance() {
     local dir="$1"
     local stamp="$dir/.beads/doltlite/.gc-maintenance.stamp"
     if ! doltlite_maintenance_due "$dir"; then
         return 0
     fi
+    # flatten/gc rewrite the store and leave its SQLite secondary indexes stale;
+    # only a reindex-capable gc build can heal that (ga-7hei). If reindex is
+    # unavailable (e.g. a default, non-native gc binary), do NOT run the
+    # stale-index-producing flatten/gc at all: creating index corruption we
+    # cannot heal and then latching the maintenance stamp "done" is worse than
+    # skipping compaction. Leave the stamp untouched so a later reindex-capable
+    # binary still runs maintenance.
+    if ! doltlite_reindex_supported "$dir"; then
+        echo "warning: skipping doltlite maintenance for $dir: no reindex-capable gc helper (build gc with -tags gascity_native_beads); leaving the store un-flattened to avoid stale indexes (ga-7hei)" >&2
+        return 0
+    fi
     echo "gc-beads-bd: running doltlite maintenance for $dir" >&2
     run_bd_doltlite "$dir" flatten --force --json >/dev/null 2>&1 || echo "warning: bd flatten failed for $dir" >&2
     run_bd_doltlite "$dir" gc --skip-decay --force --json >/dev/null 2>&1 || echo "warning: bd gc failed for $dir" >&2
+    # flatten/gc leave the SQLite secondary indexes stale; rebuild them so
+    # index-path reads don't silently return wrong data (ga-7hei). Only stamp
+    # maintenance complete when the reindex succeeds — a failed reindex (e.g. a
+    # transient SQLite lock) must stay visible and retryable on the next cycle,
+    # not be suppressed for the whole maintenance interval.
+    if ! run_doltlite_reindex "$dir"; then
+        echo "warning: doltlite reindex failed for $dir; leaving maintenance stamp unrefreshed so the next run retries (ga-7hei)" >&2
+        return 0
+    fi
     mkdir -p "$dir/.beads/doltlite" 2>/dev/null || true
     date +%s > "$stamp" 2>/dev/null || true
 }
@@ -2731,7 +2728,6 @@ op_init() {
             run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$hosted_host" ""
         fi
         ensure_beads_dir_permissions "$dir"
-        ensure_types_custom_in_yaml "$dir" "$custom_types"
         exit 0
     fi
 
@@ -2755,7 +2751,6 @@ op_init() {
         if [ "$already_ready" = true ]; then
             run_doltlite_existing_db_maintenance "$dir"
         fi
-        ensure_types_custom_in_yaml "$dir" "$custom_types"
         exit 0
     fi
 
@@ -2792,7 +2787,6 @@ op_init() {
                 # and bd-specific bootstrap only.
                 ensure_beads_dir_permissions "$dir"
                 normalize_scope_after_init "$dir" "$prefix" "$dolt_database"
-                ensure_types_custom_in_yaml "$dir" "$custom_types"
                 ensure_bd_runtime_custom_types "$dolt_database" "$custom_types"
                 ensure_bd_runtime_issue_prefix "$dolt_database" "$prefix"
                 ensure_project_identity "$dir"
@@ -2861,8 +2855,9 @@ op_init() {
     fi
 
     # Configure custom bead types without invoking `bd config set`, which can
-    # spend tens of seconds in auto-migrate on populated stores.
-    ensure_types_custom_in_yaml "$dir" "$custom_types"
+    # spend tens of seconds in auto-migrate on populated stores. The canonical
+    # .beads/config.yaml types.custom line is now Go-owned (EnsureCanonicalConfig);
+    # here we only register the types in bd's runtime SQL config table.
     ensure_bd_runtime_custom_types "$dolt_database" "$custom_types"
 
     # Keep bd's runtime config in sync with GC's canonical prefix. This is

@@ -7,13 +7,14 @@
 #   [CUSTOMIZE 3] overlap keywords in cmd_status()  (topics likely to collide on sync)
 #
 # This fork carries owned patches on an upstream we don't control. Pull upstream fixes
-# WITHOUT losing our patches. No auto-merge: a sync is a real rebase that can conflict,
-# so the default is read-only reporting + a non-mutating conflict preview.
+# WITHOUT losing our patches. A sync merges upstream on an isolated branch so
+# origin/main can advance by fast-forward after validation; the default remains
+# read-only reporting + a non-mutating conflict preview.
 #
 # Usage:
 #   scripts/fork-sync.sh status            # ahead/behind, behind-commits, owned-commits, overlap warnings
 #   scripts/fork-sync.sh preview           # non-mutating 3-way merge preview: which files would conflict
-#   scripts/fork-sync.sh sync [--execute]  # rebase owned patches onto upstream on a fresh branch (dry by default)
+#   scripts/fork-sync.sh sync [--execute]  # merge upstream on a fresh branch (dry by default)
 #
 # Safe by default: status/preview never mutate; sync is dry unless --execute and refuses
 # on a dirty tree. Never force-pushes; never touches main directly.
@@ -92,21 +93,26 @@ cmd_sync() {
     die "tracked changes present — commit/stash first."
   fi
   fetch_upstream
-  local cur branch
+  local cur branch behind
   cur="$(git rev-parse --abbrev-ref HEAD)"
   branch="fork-sync/$(git rev-parse --short "$BASE")"
-  hdr "Plan: rebase owned patches from '$cur' onto ${BASE} on new branch '$branch'"
+  behind="$(git rev-list --count "HEAD..${BASE}")"
+  if [ "$behind" -eq 0 ]; then
+    hdr "Already caught up with ${BASE}; no sync needed."
+    return 0
+  fi
+  hdr "Plan: merge ${BASE} into '$cur' on new branch '$branch'"
   git log --oneline "${BASE}..HEAD" || true
   if [ "$execute" -eq 0 ]; then
     printf '\n\033[33mDRY RUN.\033[0m Re-run with --execute to perform:\n'
-    printf '  git switch -c %s %s && git rebase %s\n' "$branch" "$cur" "$BASE"
-    printf '  # resolve conflicts, run make check (CGO: icu4c via Makefile), then fast-forward main + push origin\n'  # [CUSTOMIZE 2]
+    printf '  git switch -c %s %s && git merge --no-commit --no-ff %s\n' "$branch" "$cur" "$BASE"
+    printf '  # resolve conflicts, run make check (CGO: icu4c via Makefile), commit, then fast-forward main + push origin\n'  # [CUSTOMIZE 2]
     return 0
   fi
   git switch -c "$branch"
-  printf '\033[33mRebasing onto %s. Resolve conflicts, then run make check (icu4c CGO via Makefile).\033[0m\n' "$BASE"  # [CUSTOMIZE 2]
-  git rebase "$BASE" || die "rebase hit conflicts — resolve, 'git rebase --continue', then re-run tests. main is untouched."
-  hdr "Rebase clean on '$branch'. Validate before fast-forwarding main."
+  printf '\033[33mMerging %s without committing. Resolve conflicts, then run make check (icu4c CGO via Makefile).\033[0m\n' "$BASE"  # [CUSTOMIZE 2]
+  git merge --no-commit --no-ff "$BASE" || die "merge hit conflicts — resolve and stage them, run tests, then 'git commit'. main is untouched."
+  hdr "Merge staged on '$branch'. Validate, commit the merge, then fast-forward main."
 }
 
 case "${1:-status}" in

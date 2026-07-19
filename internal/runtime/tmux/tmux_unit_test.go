@@ -3,6 +3,7 @@ package tmux
 import (
 	"slices"
 	"testing"
+	"time"
 )
 
 // TestBuildKillTargetsFromSnapshot_ContainsBlastRadius is the acceptance
@@ -16,6 +17,7 @@ func TestBuildKillTargetsFromSnapshot_ContainsBlastRadius(t *testing.T) {
 		child     = "101" // agent's child shell
 		grandkid  = "102" // deepest — must appear before its parent (deepest-first)
 		orphan    = "103" // our child that outlived its parent: pgid 100, reparented to init
+		subreaper = "104" // our orphan adopted by a user-session subreaper instead of init
 		guiApp    = "200" // Finder-like: ppid==1 but a DIFFERENT pgid — must NOT be killed
 		otherPane = "300" // an unrelated pane's tree — must NOT be killed
 	)
@@ -24,6 +26,7 @@ func TestBuildKillTargetsFromSnapshot_ContainsBlastRadius(t *testing.T) {
 		child:     {ppid: pane, pgid: "100", start: "Mon Jul 6 08:00:01 2026"},
 		grandkid:  {ppid: child, pgid: "100", start: "Mon Jul 6 08:00:02 2026"},
 		orphan:    {ppid: "1", pgid: "100", start: "Mon Jul 6 08:00:03 2026"},
+		subreaper: {ppid: "900", pgid: "100", start: "Mon Jul 6 08:00:04 2026"},
 		guiApp:    {ppid: "1", pgid: "200", start: "Mon Jul 6 07:30:00 2026"},
 		otherPane: {ppid: "1", pgid: "300", start: "Mon Jul 6 08:00:00 2026"},
 	}
@@ -37,6 +40,9 @@ func TestBuildKillTargetsFromSnapshot_ContainsBlastRadius(t *testing.T) {
 	// The reparented orphan (our pgid + ppid==1) is collected.
 	if !slices.Contains(reparented, orphan) {
 		t.Errorf("reparented orphan %s (our pgid, reparented to init) must be collected, got %v", orphan, reparented)
+	}
+	if !slices.Contains(reparented, subreaper) {
+		t.Errorf("subreaper orphan %s (our pgid, parent outside tree) must be collected, got %v", subreaper, reparented)
 	}
 	// BLAST-RADIUS GUARD: a ppid==1 GUI app on a different pgid is NEVER a target.
 	all := append(append([]string{}, descendants...), reparented...)
@@ -134,16 +140,17 @@ func TestComputeExcludingKillSet_ExternalCallerKillsEverything(t *testing.T) {
 
 	killList, killPaneLeader := computeExcludingKillSet(
 		agentPID,
-		[]string{"201"},
-		[]string{"202"},
+		[]string{"203", "201"},
+		[]string{"202", "201"},
 		exclude,
 	)
 
 	if !killPaneLeader {
 		t.Error("pane leader must be killed for an external caller")
 	}
-	if !slices.Contains(killList, "201") || !slices.Contains(killList, "202") {
-		t.Errorf("all pane descendants must be killed, got %v", killList)
+	want := []string{"203", "201", "202"}
+	if !slices.Equal(killList, want) {
+		t.Errorf("kill list = %v, want deepest-first descendants followed by unique reparented processes %v", killList, want)
 	}
 }
 
@@ -185,5 +192,167 @@ func TestKillIdentityMatches_PIDReuseSkipsKill(t *testing.T) {
 				t.Errorf("killIdentityMatches(%q, %q) = %v, want %v", tc.current, tc.want, got, tc.signal)
 			}
 		})
+	}
+}
+
+func TestTerminateProcessSetReturnsWhenTerminatedProcessesExit(t *testing.T) {
+	alive := map[string]bool{"101": true, "102": true}
+	var signals []string
+	var sleeps []time.Duration
+	now := time.Unix(0, 0)
+
+	terminateProcessSet(
+		[]string{"101", "102"},
+		time.Second,
+		func(pid, signal string) {
+			signals = append(signals, signal+":"+pid)
+			if signal == "TERM" {
+				alive[pid] = false
+			}
+		},
+		func(pid string) bool { return alive[pid] },
+		func(delay time.Duration) {
+			sleeps = append(sleeps, delay)
+			now = now.Add(delay)
+		},
+		func() time.Time { return now },
+	)
+
+	if want := []string{"TERM:101", "TERM:102"}; !slices.Equal(signals, want) {
+		t.Fatalf("signals = %v, want %v", signals, want)
+	}
+	if len(sleeps) != 0 {
+		t.Fatalf("sleep calls = %v, want none after TERM made every process exit", sleeps)
+	}
+}
+
+func TestTerminateProcessSetKillsOnlyProcessesStillAliveAfterGracePeriod(t *testing.T) {
+	alive := map[string]bool{"201": true, "202": true}
+	var signals []string
+	var slept time.Duration
+	now := time.Unix(0, 0)
+
+	terminateProcessSet(
+		[]string{"201", "202"},
+		2*processExitCheckInterval,
+		func(pid, signal string) {
+			signals = append(signals, signal+":"+pid)
+			if signal == "TERM" && pid == "201" {
+				alive[pid] = false
+			}
+		},
+		func(pid string) bool { return alive[pid] },
+		func(delay time.Duration) {
+			slept += delay
+			now = now.Add(delay)
+		},
+		func() time.Time { return now },
+	)
+
+	want := []string{"TERM:201", "TERM:202", "KILL:202"}
+	if !slices.Equal(signals, want) {
+		t.Fatalf("signals = %v, want %v", signals, want)
+	}
+	if slept != 2*processExitCheckInterval {
+		t.Fatalf("slept = %s, want full grace period %s for surviving process", slept, 2*processExitCheckInterval)
+	}
+}
+
+func TestTerminateProcessSetReturnsWhenProcessExitsDuringGracePeriod(t *testing.T) {
+	var signals []string
+	checks := 0
+	slept := time.Duration(0)
+	now := time.Unix(0, 0)
+
+	terminateProcessSet(
+		[]string{"301"},
+		time.Second,
+		func(pid, signal string) { signals = append(signals, signal+":"+pid) },
+		func(string) bool {
+			checks++
+			return checks < 3
+		},
+		func(delay time.Duration) {
+			slept += delay
+			now = now.Add(delay)
+		},
+		func() time.Time { return now },
+	)
+
+	if want := []string{"TERM:301"}; !slices.Equal(signals, want) {
+		t.Fatalf("signals = %v, want %v", signals, want)
+	}
+	if slept != 2*processExitCheckInterval {
+		t.Fatalf("slept = %s, want two observations (%s)", slept, 2*processExitCheckInterval)
+	}
+}
+
+func TestTerminateProcessSetCountsProbeTimeAgainstGracePeriod(t *testing.T) {
+	var signals []string
+	slept := time.Duration(0)
+	now := time.Unix(0, 0)
+	probeDuration := 2 * processExitCheckInterval
+
+	terminateProcessSet(
+		[]string{"401"},
+		3*processExitCheckInterval,
+		func(pid, signal string) { signals = append(signals, signal+":"+pid) },
+		func(string) bool {
+			now = now.Add(probeDuration)
+			return true
+		},
+		func(delay time.Duration) {
+			slept += delay
+			now = now.Add(delay)
+		},
+		func() time.Time { return now },
+	)
+
+	if want := []string{"TERM:401", "KILL:401"}; !slices.Equal(signals, want) {
+		t.Fatalf("signals = %v, want %v", signals, want)
+	}
+	if slept != processExitCheckInterval {
+		t.Fatalf("slept = %s, want remaining grace budget %s after slow probe", slept, processExitCheckInterval)
+	}
+}
+
+// knownSet builds a descendant-set lookup from the given pids.
+func knownSet(pids ...string) map[string]bool {
+	m := make(map[string]bool, len(pids))
+	for _, p := range pids {
+		m[p] = true
+	}
+	return m
+}
+
+func TestReparentedOrphans_CollectsInitAndSubreaperOrphans(t *testing.T) {
+	// leader=100, one live descendant=200. Group also holds:
+	//   300 reparented to init (ppid 1) — classic case
+	//   400 reparented to systemd --user subreaper (ppid 900) — the case the
+	//        old PPID==1 test missed
+	//   500 still a child of a live descendant (ppid 200) — owned elsewhere
+	//   600 whose parent read failed ("") — must be skipped
+	known := knownSet("100", "200")
+	parents := map[string]string{
+		"300": "1",
+		"400": "900", // systemd --user pid, not init
+		"500": "200",
+		"600": "",
+	}
+	parentOf := func(pid string) string { return parents[pid] }
+
+	got := reparentedOrphans([]string{"200", "300", "400", "500", "600"}, known, parentOf)
+	slices.Sort(got)
+	want := []string{"300", "400"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("reparentedOrphans = %v, want %v", got, want)
+	}
+}
+
+func TestReparentedOrphans_SkipsKnownDescendants(t *testing.T) {
+	known := knownSet("100", "200", "300")
+	parentOf := func(string) string { return "1" }
+	if got := reparentedOrphans([]string{"200", "300"}, known, parentOf); len(got) != 0 {
+		t.Fatalf("reparentedOrphans = %v, want empty (all are known descendants)", got)
 	}
 }

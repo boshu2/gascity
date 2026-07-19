@@ -1,7 +1,6 @@
 package tmux
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -23,12 +22,12 @@ func shrinkLatchWindow(t *testing.T, d time.Duration) {
 
 // isolateTmuxTmpdir points TMUX_TMPDIR at a per-test tempdir so socket-unlink
 // escalation can never touch a real tmux socket. Returns the socket path the
-// provider under test would resolve for socketName.
-func isolateTmuxTmpdir(t *testing.T, socketName string) string {
+// degraded-server test provider resolves.
+func isolateTmuxTmpdir(t *testing.T) string {
 	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("TMUX_TMPDIR", tmp)
-	return filepath.Join(tmp, fmt.Sprintf("tmux-%d", os.Getuid()), socketName)
+	return filepath.Join(tmp, fmt.Sprintf("tmux-%d", os.Getuid()), "gc-degraded")
 }
 
 // stubStartTime replaces the processStartTimeFn seam. Restored via t.Cleanup.
@@ -72,7 +71,7 @@ func countKillServerCalls(calls [][]string) int {
 
 func TestDegradedProbesBelowCountThresholdNoRecovery(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	isolateTmuxTmpdir(t, "gc-degraded")
+	isolateTmuxTmpdir(t)
 
 	fe := &fakeExecutor{err: errors.New("tmux has-session: connection wedged")}
 	tm := &Tmux{cfg: Config{SocketName: "gc-degraded"}, exec: fe}
@@ -89,7 +88,7 @@ func TestDegradedProbesBelowCountThresholdNoRecovery(t *testing.T) {
 
 func TestDegradedProbesBelowWindowThresholdNoRecovery(t *testing.T) {
 	shrinkLatchWindow(t, time.Hour) // count will be met; span cannot be
-	isolateTmuxTmpdir(t, "gc-degraded")
+	isolateTmuxTmpdir(t)
 
 	fe := &fakeExecutor{err: errors.New("tmux has-session: connection wedged")}
 	tm := &Tmux{cfg: Config{SocketName: "gc-degraded"}, exec: fe}
@@ -106,7 +105,7 @@ func TestDegradedProbesBelowWindowThresholdNoRecovery(t *testing.T) {
 
 func TestHealthyProbeResetsDegradedStreak(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	isolateTmuxTmpdir(t, "gc-degraded")
+	isolateTmuxTmpdir(t)
 
 	wedge := errors.New("tmux has-session: connection wedged")
 	// degraded, degraded, healthy (session-not-found), degraded, degraded:
@@ -129,7 +128,7 @@ func TestHealthyProbeResetsDegradedStreak(t *testing.T) {
 
 func TestDegradedLatchTripIssuesKillServerAndNewSessionRecovers(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	isolateTmuxTmpdir(t, "gc-degraded")
+	isolateTmuxTmpdir(t)
 
 	wedge := errors.New("tmux has-session: connection wedged")
 	// 3 degraded probes, then kill-server succeeds, then the post-recovery
@@ -165,14 +164,14 @@ func TestDegradedLatchTripIssuesKillServerAndNewSessionRecovers(t *testing.T) {
 
 func TestDegradedRecoveryEscalatesToSigkillAndUnlinksSocket(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	sock := isolateTmuxTmpdir(t, "gc-degraded")
+	sock := isolateTmuxTmpdir(t)
 	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(sock, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stubStartTime(t, func(pid string) string { return "Mon Jul 6 10:00:00 2026" })
+	stubStartTime(t, func(_ string) string { return "Mon Jul 6 10:00:00 2026" })
 	killed := stubSigkill(t)
 
 	// Every tmux call fails, including the kill-server escalation step.
@@ -198,7 +197,7 @@ func TestDegradedRecoveryEscalatesToSigkillAndUnlinksSocket(t *testing.T) {
 
 func TestDegradedRecoverySkipsSigkillOnIdentityMismatch(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	sock := isolateTmuxTmpdir(t, "gc-degraded")
+	sock := isolateTmuxTmpdir(t)
 	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +205,7 @@ func TestDegradedRecoverySkipsSigkillOnIdentityMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// PID has been recycled: current start time differs from the cached one.
-	stubStartTime(t, func(pid string) string { return "Tue Jul 7 09:00:00 2026" })
+	stubStartTime(t, func(_ string) string { return "Tue Jul 7 09:00:00 2026" })
 	killed := stubSigkill(t)
 
 	fe := &fakeExecutor{err: errors.New("tmux: server wedged solid")}
@@ -231,7 +230,7 @@ func TestDegradedRecoverySkipsSigkillOnIdentityMismatch(t *testing.T) {
 
 func TestDegradedLatchResetsAfterRecovery(t *testing.T) {
 	shrinkLatchWindow(t, 0)
-	isolateTmuxTmpdir(t, "gc-degraded")
+	isolateTmuxTmpdir(t)
 
 	// All calls fail (probes and kill-server); no cached PID so escalation is
 	// kill-server + unlink only.
@@ -307,53 +306,4 @@ func contains(slice []string, s string) bool {
 		}
 	}
 	return false
-}
-
-// --- companion: state cache installs empty snapshot when server is gone ---------
-
-// noServerProbeFetcher wraps mockFetcher with the optional no-server probe.
-type noServerProbeFetcher struct {
-	*mockFetcher
-	noServer bool
-}
-
-func (f *noServerProbeFetcher) probeNoServer(_ context.Context) bool {
-	return f.noServer
-}
-
-func TestStateCache_FetchFailureWithNoServerProbeInstallsEmptySnapshot(t *testing.T) {
-	inner := &mockFetcher{sessions: map[string]bool{"gc-a": true}}
-	fetcher := &noServerProbeFetcher{mockFetcher: inner, noServer: true}
-	cache := NewStateCache(fetcher, 50*time.Millisecond)
-
-	if !cache.IsRunning("gc-a") {
-		t.Fatal("seed refresh should report gc-a running")
-	}
-
-	// Fetch now fails (e.g. timeout) but the follow-up probe says the server
-	// is definitively gone: the empty snapshot must be installed immediately,
-	// NOT held back behind the 30s staleTTL last-known-good window.
-	inner.setResult(nil, errors.New("fetch: context deadline exceeded"))
-	cache.Invalidate()
-
-	if cache.IsRunning("gc-a") {
-		t.Fatal("IsRunning = true after fetch failure + no-server probe, want false immediately (empty snapshot installed)")
-	}
-}
-
-func TestStateCache_FetchFailureWithoutNoServerKeepsLastKnownGood(t *testing.T) {
-	inner := &mockFetcher{sessions: map[string]bool{"gc-a": true}}
-	fetcher := &noServerProbeFetcher{mockFetcher: inner, noServer: false}
-	cache := NewStateCache(fetcher, 50*time.Millisecond)
-
-	if !cache.IsRunning("gc-a") {
-		t.Fatal("seed refresh should report gc-a running")
-	}
-
-	inner.setResult(nil, errors.New("fetch: transient failure"))
-	cache.Invalidate()
-
-	if !cache.IsRunning("gc-a") {
-		t.Fatal("IsRunning = false after transient fetch failure, want last-known-good preserved")
-	}
 }
