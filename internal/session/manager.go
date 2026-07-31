@@ -1689,7 +1689,10 @@ func templateOverrideWakeInFlight(metadata map[string]string, state State, now t
 // against its cutoff for a session in the given state. Suspended sessions keep
 // the historical CreatedAt fallback for legacy beads. Asleep sessions normally
 // require slept_at, except legacy drained-asleep beads without slept_at can use
-// the bead update timestamp because sleep_reason=drained is terminal.
+// the bead update timestamp because sleep_reason=drained is terminal. Draining
+// and drained both key off drain_at, the stamp BeginDrainPatch writes at the
+// drain transition; a draining record with no drain_at has no trustworthy age
+// and is skipped.
 func pruneStateTimestamp(b beads.Bead, state State) (time.Time, bool) {
 	switch state {
 	case StateSuspended:
@@ -1716,7 +1719,7 @@ func pruneStateTimestamp(b beads.Bead, state State) (time.Time, bool) {
 			return b.CreatedAt, true
 		}
 		return time.Time{}, false
-	case StateDrained:
+	case StateDrained, StateDraining:
 		return parsePruneMetadataTimestamp(b.Metadata, "drain_at")
 	default:
 		return time.Time{}, false
@@ -1749,9 +1752,20 @@ func (m *Manager) Prune(before time.Time) (int, error) {
 // PruneDetailed closes terminal-state sessions whose state timestamp is before
 // the given cutoff and reports the affected session IDs and queued wait nudges.
 // When no states are supplied it defaults to [StateSuspended] for backward
-// compatibility. Callers may opt in to asleep or drained cleanup by passing
-// StateAsleep or StateDrained. StateDrained also matches legacy
-// state=asleep/sleep_reason=drained beads.
+// compatibility. Callers may opt in to asleep, drained, or draining cleanup by
+// passing StateAsleep, StateDrained, or StateDraining. StateDrained also matches
+// legacy state=asleep/sleep_reason=drained beads.
+//
+// StateDraining is the one non-terminal state prune accepts, and it carries an
+// extra gate: the record is closed only when its runtime is CONFIRMED absent
+// (see runtimeAbsent). Every uncertain outcome — no provider, a failed or
+// partial provider enumeration, an unnamed record, or a liveness probe that
+// still sees the session — fails closed and prunes nothing. A drain that is
+// still in flight owns a live runtime and is left alone; a draining record
+// whose runtime is provably gone is a corpse whose drain can never complete,
+// and it is otherwise unreachable — reapStaleSessionBeads only reaps
+// state=creating, and cleanupDeadRuntimeSessionCorpses only considers records
+// whose runtime name is still visible to the provider.
 func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult, error) {
 	if len(states) == 0 {
 		states = []State{StateSuspended}
@@ -1767,6 +1781,8 @@ func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult,
 		return PruneResult{}, fmt.Errorf("listing sessions: %w", err)
 	}
 	result := PruneResult{}
+	var pic runtimePicture
+	runtimeObserved := false
 	for _, b := range all {
 		if !IsSessionBeadOrRepairable(b) {
 			continue
@@ -1785,6 +1801,18 @@ func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult,
 		if !ts.Before(before) {
 			continue
 		}
+		if state == StateDraining {
+			// Enumerate the provider once, on first need, and reuse it for
+			// every draining candidate in this pass. Prune passes that do not
+			// opt into draining never touch the provider at all.
+			if !runtimeObserved {
+				pic = observeRuntimePicture(m.sp)
+				runtimeObserved = true
+			}
+			if !m.runtimeAbsent(b, pic) {
+				continue
+			}
+		}
 		nudgeIDs, capped, err := NewStore(beads.SessionStore{Store: m.store}).CancelWaits(b.ID, time.Now().UTC())
 		if err != nil && !beads.IsLookupLimitError(err) {
 			return result, fmt.Errorf("canceling waits for session %s: %w", b.ID, err)
@@ -1800,6 +1828,69 @@ func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult,
 		result.SessionIDs = append(result.SessionIDs, b.ID)
 	}
 	return result, nil
+}
+
+// runtimePicture is a single trusted enumeration of the provider's running
+// sessions. Known is false whenever the enumeration could not be completed, in
+// which case NO session's runtime may be treated as confirmed absent.
+type runtimePicture struct {
+	Known   bool
+	Running map[string]bool
+}
+
+// observeRuntimePicture enumerates the provider's running sessions once. It is
+// deliberately built on ListRunning, the only Provider method that reports
+// failure: IsRunning and ProcessAlive return a bare bool and collapse "the
+// provider is unreachable" into the same false as "the session is gone", so
+// neither can establish confirmed absence on its own. A hard error or a
+// PartialListError both yield Known=false — a partial enumeration cannot prove
+// a name's absence, only its presence.
+func observeRuntimePicture(sp runtime.Provider) runtimePicture {
+	if sp == nil {
+		return runtimePicture{}
+	}
+	names, err := sp.ListRunning("")
+	if err != nil {
+		// Covers both hard failures and runtime.IsPartialListError degraded
+		// results. Either way the enumeration is not authoritative for absence.
+		return runtimePicture{}
+	}
+	running := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name = strings.TrimSpace(name); name != "" {
+			running[name] = true
+		}
+	}
+	return runtimePicture{Known: true, Running: running}
+}
+
+// runtimeAbsent reports whether a session bead's runtime is CONFIRMED gone.
+// Every uncertain outcome fails closed and returns false, so prune leaves the
+// record alone:
+//
+//   - no provider wired: nothing can be confirmed;
+//   - the provider enumeration errored or was partial (pic.Known false);
+//   - the bead reserves no session_name, so there is no runtime identity to
+//     confirm absent — an unnamed record is unproven, not proven gone;
+//   - the name is present in the enumeration;
+//   - the per-session liveness probe still reports Running or Alive, which
+//     catches an agent process that outlived its provider session.
+//
+// Only when the enumeration is trustworthy AND the name is missing from it AND
+// the liveness probe agrees is the runtime confirmed absent.
+func (m *Manager) runtimeAbsent(b beads.Bead, pic runtimePicture) bool {
+	if m.sp == nil || !pic.Known {
+		return false
+	}
+	name := strings.TrimSpace(b.Metadata["session_name"])
+	if name == "" {
+		return false
+	}
+	if pic.Running[name] {
+		return false
+	}
+	obs := runtime.ObserveLiveness(m.sp, name, nil)
+	return !obs.Running && !obs.Alive
 }
 
 func pruneStateAllowed(state State, metadata map[string]string, allowed map[State]struct{}) bool {

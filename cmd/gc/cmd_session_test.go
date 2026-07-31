@@ -212,6 +212,11 @@ func TestParsePruneStates(t *testing.T) {
 		{"suspended", []worker.SessionState{worker.SessionStateSuspended}, false},
 		{"asleep", []worker.SessionState{worker.SessionStateAsleep}, false},
 		{"drained", []worker.SessionState{worker.SessionStateDrained}, false},
+		// draining is opt-in and runtime-gated: PruneDetailed only closes a
+		// draining record whose runtime is confirmed absent, so accepting the
+		// name here does not admit an in-flight session to the prune pass.
+		{"draining", []worker.SessionState{worker.SessionStateDraining}, false},
+		{"drained,draining", []worker.SessionState{worker.SessionStateDrained, worker.SessionStateDraining}, false},
 		{"asleep,suspended", []worker.SessionState{worker.SessionStateAsleep, worker.SessionStateSuspended}, false},
 		{"asleep,suspended,drained", []worker.SessionState{worker.SessionStateAsleep, worker.SessionStateSuspended, worker.SessionStateDrained}, false},
 		{" suspended , asleep ", []worker.SessionState{worker.SessionStateSuspended, worker.SessionStateAsleep}, false},
@@ -220,7 +225,7 @@ func TestParsePruneStates(t *testing.T) {
 		{"", nil, true},
 		{",", nil, true},
 		{"active", nil, true},
-		{"draining", nil, true},
+		{"creating", nil, true},
 		{"suspended,bogus", nil, true},
 	}
 	for _, tt := range tests {
@@ -327,6 +332,64 @@ func TestCmdSessionPruneStateFilterClosesSelectedDormantSessions(t *testing.T) {
 	}
 	if b.Status != "open" {
 		t.Fatalf("active status = %q, want open", b.Status)
+	}
+}
+
+// End-to-end recovery path for the stuck class: a session record parked in
+// draining whose runtime is gone. Before draining was prune-eligible the
+// command rejected the state outright and the record had no way out.
+func TestCmdSessionPruneDrainingClosesRecordWithAbsentRuntime(t *testing.T) {
+	clearGCEnv(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	old := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	draining, err := store.Create(beads.Bead{
+		Title:  "draining-old",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "draining-old",
+			"template":     "test",
+			"state":        string(session.StateDraining),
+			"state_reason": session.DrainAckStopPendingReason,
+			"drain_at":     old,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create draining session: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionPrune("7d", "draining", &stdout, &stderr, true); code != 0 {
+		t.Fatalf("cmdSessionPrune = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var got sessionActionResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	if got.State != "draining" {
+		t.Fatalf("state = %q, want draining; stdout=%q", got.State, stdout.String())
+	}
+	if got.Count == nil || *got.Count != 1 {
+		t.Fatalf("count = %v, want 1; stdout=%q", got.Count, stdout.String())
+	}
+	b, err := store.Get(draining.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", draining.ID, err)
+	}
+	if b.Status != "closed" {
+		t.Fatalf("draining session %s status = %q, want closed", draining.ID, b.Status)
 	}
 }
 

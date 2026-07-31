@@ -1983,12 +1983,22 @@ func (p *Provider) IsRunning(name string) bool {
 }
 
 // ListRunning enumerates live GC-managed session names from the T3 snapshot.
+//
+// A soft-unavailable snapshot (transient bridge error, or the session still
+// initializing) yields a PartialListError rather than an empty list. Returning
+// (nil, nil) there would be indistinguishable from "the bridge is healthy and
+// no sessions are running", so any caller reasoning about a session's ABSENCE
+// — the adoption barrier, the dead-runtime corpse sweep, prune's confirmed-
+// absence gate — would treat a transient outage as proof every T3 session had
+// vanished. PartialListError is the established signal for "degraded, trust
+// presence but never absence"; existing callers already branch on
+// runtime.IsPartialListError.
 func (p *Provider) ListRunning(prefix string) ([]string, error) {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
 		if isSoftBridgeUnavailable(err) {
 			fmt.Fprintf(os.Stderr, "t3bridge: ListRunning(%s) — soft-unavailable: %v\n", prefix, err)
-			return nil, nil
+			return nil, &runtime.PartialListError{Err: fmt.Errorf("t3bridge snapshot unavailable: %w", err)}
 		}
 		return nil, err
 	}

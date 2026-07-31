@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1001,5 +1002,51 @@ func TestResolveConfigProviderModel_PrefersStoredEnvelopeIntent(t *testing.T) {
 	}
 	if model != "gpt-5.4-mini" {
 		t.Fatalf("model = %q, want gpt-5.4-mini", model)
+	}
+}
+
+// TestListRunningSoftUnavailableIsPartialNotEmpty pins the fail-closed contract
+// for absence reasoning: when the bridge snapshot cannot be fetched because the
+// bridge is transiently unreachable, ListRunning must report a degraded
+// enumeration, NOT an authoritative empty list.
+//
+// Returning (nil, nil) here is indistinguishable from "the bridge is healthy and
+// nothing is running", so every caller that reasons about a session's ABSENCE —
+// the adoption barrier, the dead-runtime corpse sweep, and prune's
+// confirmed-absence gate for draining records — would treat a transient outage
+// as proof that every T3 session had vanished.
+func TestListRunningSoftUnavailableIsPartialNotEmpty(t *testing.T) {
+	resetBridgeAuthCacheForTest(t)
+
+	// Bind and immediately release a loopback port so nothing is listening:
+	// dialing it yields "connection refused", which isTransientBridgeError
+	// classifies as a soft bridge outage.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a dead port: %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing listener: %v", err)
+	}
+
+	t.Setenv("T3_BEARER_TOKEN", "test-bearer")
+	t.Setenv("T3_WS_URL", "ws://"+deadAddr)
+	t.Setenv("GC_T3BRIDGE_STATE_DIR", t.TempDir())
+
+	p := &Provider{
+		watchers:     make(map[string]context.CancelFunc),
+		recentStarts: make(map[string]time.Time),
+	}
+
+	names, err := p.ListRunning("")
+	if err == nil {
+		t.Fatalf("ListRunning during a bridge outage returned (%v, nil); an empty list with no error is read as authoritative absence", names)
+	}
+	if !runtime.IsPartialListError(err) {
+		t.Fatalf("ListRunning error = %v, want a runtime.PartialListError so callers can branch on IsPartialListError", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("ListRunning names = %v, want none alongside the degraded signal", names)
 	}
 }

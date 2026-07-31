@@ -1924,11 +1924,17 @@ func newSessionPruneCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Close old dormant sessions",
 		Long: `Close dormant sessions older than a given age. By default only
 suspended sessions are affected — active sessions are never pruned. Pass
---state to opt asleep or drained sessions into the same cleanup pass; multiple
-states may be comma-separated.`,
+--state to opt asleep, drained, or draining sessions into the same cleanup
+pass; multiple states may be comma-separated.
+
+--state draining is the recovery path for a session record whose drain can
+never complete because its runtime is gone. Such a record is closed only when
+the runtime is confirmed absent, so a drain that is still in flight is left
+running.`,
 		Example: `  gc session prune --before 7d
   gc session prune --before 24h
-  gc session prune --state asleep,suspended,drained --before 1h`,
+  gc session prune --state asleep,suspended,drained --before 1h
+  gc session prune --state draining --before 1h`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if cmdSessionPrune(beforeStr, statesStr, stdout, stderr, jsonOutput) != 0 {
@@ -1938,7 +1944,7 @@ states may be comma-separated.`,
 		},
 	}
 	cmd.Flags().StringVar(&beforeStr, "before", "7d", "prune sessions older than this duration (e.g., 7d, 24h)")
-	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep, drained)")
+	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep, drained, draining)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
 	return cmd
 }
@@ -2019,9 +2025,12 @@ func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, json
 }
 
 // parsePruneStates parses a comma-separated list of session state names
-// for `gc session prune --state`. Only terminal-dormant states are accepted
-// (suspended, asleep, drained) — active or in-flight states are rejected to
-// keep the prune pass safe.
+// for `gc session prune --state`. Terminal-dormant states (suspended, asleep,
+// drained) are accepted, plus draining — active and in-flight states are
+// rejected to keep the prune pass safe. Draining is admitted because
+// PruneDetailed gates it on a confirmed-absent runtime: an in-flight drain
+// still owns its runtime and is never closed, while a draining record whose
+// runtime is gone has no other recovery path.
 func parsePruneStates(s string) ([]worker.SessionState, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, fmt.Errorf("--state must not be empty")
@@ -2041,8 +2050,10 @@ func parsePruneStates(s string) ([]worker.SessionState, error) {
 			st = worker.SessionStateAsleep
 		case string(worker.SessionStateDrained):
 			st = worker.SessionStateDrained
+		case string(worker.SessionStateDraining):
+			st = worker.SessionStateDraining
 		default:
-			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep, drained)", name)
+			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep, drained, draining)", name)
 		}
 		if _, dup := seen[st]; dup {
 			continue

@@ -3318,6 +3318,266 @@ func TestPruneDetailedDrainedOptInUsesDrainAt(t *testing.T) {
 	}
 }
 
+// newDrainingSession creates a session, parks it in the draining state with the
+// given drain_at, and returns its Info. It mirrors the shape a drain-acked
+// session carries on disk: state=draining plus the drain_at stamp that
+// BeginDrainPatch writes at the transition.
+func newDrainingSession(t *testing.T, mgr *Manager, store beads.Store, title, drainAt string) Info {
+	t.Helper()
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: title, Command: "echo x", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("CreateSession(%s): %v", title, err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string{
+		"state":        string(StateDraining),
+		"state_reason": DrainAckStopPendingReason,
+		"drain_at":     drainAt,
+	}); err != nil {
+		t.Fatalf("park %s in draining: %v", title, err)
+	}
+	return info
+}
+
+// A session record parked in draining whose runtime is gone is a corpse: the
+// drain it was waiting on can never complete. Prune must be able to reach it.
+func TestPruneDetailedDrainingOptInPrunesRecordWithAbsentRuntime(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	corpse := newDrainingSession(t, mgr, store, "Draining Corpse", tenDaysAgo)
+
+	// The runtime is gone — this is the stuck class observed in the field.
+	if err := sp.Stop(corpse.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+	if sp.IsRunning(corpse.SessionName) {
+		t.Fatalf("precondition: runtime %q still running", corpse.SessionName)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("prune count = %d, want 1; pruned=%v", result.Count, result.SessionIDs)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != corpse.ID {
+		t.Fatalf("pruned %v, want [%s]", result.SessionIDs, corpse.ID)
+	}
+}
+
+// The safety half: a draining session whose runtime is still live is genuinely
+// in flight. Opting draining into the prune pass must never close it.
+func TestPruneDetailedDrainingOptInSkipsRecordWithLiveRuntime(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	inFlight := newDrainingSession(t, mgr, store, "Draining In Flight", tenDaysAgo)
+
+	if !sp.IsRunning(inFlight.SessionName) {
+		t.Fatalf("precondition: runtime %q is not running", inFlight.SessionName)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (a live drain must never be pruned); pruned=%v", result.Count, result.SessionIDs)
+	}
+	got, err := mgr.Get(inFlight.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Closed {
+		t.Fatalf("session %s closed; a draining session with a live runtime must stay open", inFlight.ID)
+	}
+}
+
+// Draining stays opt-in: the default pass and the other terminal-dormant states
+// must not sweep it up.
+func TestPruneDetailedSkipsDrainingWithoutOptIn(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	corpse := newDrainingSession(t, mgr, store, "Draining Not Opted In", tenDaysAgo)
+	if err := sp.Stop(corpse.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	for _, states := range [][]State{nil, {StateSuspended}, {StateAsleep, StateDrained}} {
+		result, err := mgr.PruneDetailed(cutoff, states...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Count != 0 {
+			t.Fatalf("PruneDetailed(states=%v) count = %d, want 0; pruned=%v", states, result.Count, result.SessionIDs)
+		}
+	}
+}
+
+// partialListProvider wraps a Fake and degrades ListRunning to a
+// PartialListError: some backends answered, one did not. The names it does
+// return are real, but the enumeration cannot prove any name's ABSENCE, so
+// prune must treat the runtime picture as unknown.
+type partialListProvider struct {
+	*runtime.Fake
+}
+
+func (p partialListProvider) ListRunning(prefix string) ([]string, error) {
+	names, err := p.Fake.ListRunning(prefix)
+	if err != nil {
+		return nil, err
+	}
+	return names, &runtime.PartialListError{
+		Err: errors.New("one backend unreachable"),
+	}
+}
+
+// The blocker case: a provider that cannot answer must never produce a prune.
+// A broken provider's IsRunning returns false, which is indistinguishable from
+// "the session is gone" — so absence has to be established by an enumeration
+// that can report its own failure, not by a bare bool.
+func TestPruneDetailedDrainingFailsClosedOnProviderError(t *testing.T) {
+	store := beads.NewMemStore()
+	healthy := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, healthy)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	rec := newDrainingSession(t, mgr, store, "Draining Unobservable", tenDaysAgo)
+
+	// Swap in a provider whose every operation fails. Its IsRunning reports
+	// false for the still-live session — the exact conflation this gate must
+	// not fall for.
+	broken := runtime.NewFailFake()
+	if broken.IsRunning(rec.SessionName) {
+		t.Fatalf("precondition: broken fake should report IsRunning=false")
+	}
+	if _, err := broken.ListRunning(""); err == nil {
+		t.Fatalf("precondition: broken fake ListRunning must error")
+	}
+	brokenMgr := NewManagerWithOptions(store, broken)
+
+	result, err := brokenMgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (an unobservable provider proves nothing); pruned=%v", result.Count, result.SessionIDs)
+	}
+	got, err := brokenMgr.Get(rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Closed {
+		t.Fatalf("session %s closed; a record whose runtime could not be observed must stay open", rec.ID)
+	}
+}
+
+// A degraded-but-usable enumeration can prove presence but never absence.
+func TestPruneDetailedDrainingFailsClosedOnPartialListResult(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, fake)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	rec := newDrainingSession(t, mgr, store, "Draining Partial List", tenDaysAgo)
+	if err := fake.Stop(rec.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+
+	partialMgr := NewManagerWithOptions(store, partialListProvider{Fake: fake})
+	if _, err := partialMgr.sp.ListRunning(""); !runtime.IsPartialListError(err) {
+		t.Fatalf("precondition: provider must return a PartialListError, got %v", err)
+	}
+
+	result, err := partialMgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (a partial enumeration cannot prove absence); pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
+// No provider at all is the same class of uncertainty.
+func TestPruneDetailedDrainingFailsClosedWithNoProvider(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, fake)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	rec := newDrainingSession(t, mgr, store, "Draining No Provider", tenDaysAgo)
+	if err := fake.Stop(rec.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+
+	nilMgr := NewManagerWithOptions(store, nil)
+	result, err := nilMgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (no provider proves nothing); pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
+// A draining record that reserves no session_name has no runtime identity to
+// confirm absent. Unproven is not proven-gone.
+func TestPruneDetailedDrainingFailsClosedWithoutSessionName(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, fake)
+
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	rec := newDrainingSession(t, mgr, store, "Draining No Name", tenDaysAgo)
+	if err := fake.Stop(rec.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+	if err := store.SetMetadata(rec.ID, "session_name", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(-7*24*time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (no reserved name means nothing to confirm); pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
+// A draining record with no drain_at stamp has no trustworthy age, so it must
+// not be pruned on the cutoff alone.
+func TestPruneDetailedSkipsDrainingWithoutDrainAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	corpse := newDrainingSession(t, mgr, store, "Draining No DrainAt", "")
+	if err := store.SetMetadata(corpse.ID, "drain_at", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Stop(corpse.SessionName); err != nil {
+		t.Fatalf("Stop runtime: %v", err)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(time.Hour), StateDraining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0 (no drain_at means unknown age); pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
 func TestSendResumesSuspendedSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
