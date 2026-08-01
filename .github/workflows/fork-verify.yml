@@ -49,3 +49,10 @@ jobs:
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+      - name: Unit tests — session prune draining gate (this branch)
+        run: |
+          go test ./internal/session/ -run 'TestPrune' -count=1 -v
+          go test ./internal/worker/ -run 'TestPrune' -count=1
+          go test ./cmd/gc/ -run 'TestParsePruneStates|TestCmdSessionPrune' -count=1 -v
+      - name: Unit tests — t3bridge fail-closed ListRunning (this branch)
+        run: go test ./internal/runtime/t3bridge/ -run 'TestListRunningSoftUnavailable' -count=1 -v
