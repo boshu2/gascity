@@ -3299,6 +3299,122 @@ func TestSharedServerContinuityAfterHandoffStop(t *testing.T) {
 	}
 }
 
+// TestSelfCloseExcludedInPaneCallerSurvivesCleanup covers the live self-close
+// ordering that the reordered teardown introduced, against a plan captured from
+// a real pane. Two properties have to hold together, and only the pairing is
+// new: the walk must recognize an in-pane caller as an OWNED exclusion, and an
+// owned exclusion must run the direct cleanup BEFORE tmux kill-session. A
+// caller the walk misses is misclassified as foreign, kill-session runs first,
+// and tmux can reap the caller mid-cleanup. The unit tests assert the ordering
+// only against a synthetic plan, which by construction cannot reproduce that
+// misclassification; capturing the plan from a live pane here does.
+//
+// The caller is legitimately reaped by kill-session at the very end, so its
+// survival is asserted against the direct signal sweep, not past teardown.
+func TestSelfCloseExcludedInPaneCallerSurvivesCleanup(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	socket := fmt.Sprintf("gctest-selfclose-%d-%d", os.Getpid(), time.Now().UnixNano())
+	cfg := DefaultConfig()
+	cfg.SocketName = socket
+	provider := NewProviderWithConfig(cfg)
+	tmux := provider.Tmux()
+	_ = provider.TeardownServer()
+	t.Cleanup(func() { _ = provider.TeardownServer() })
+
+	// The pane stands in for a self-closing session: the pane leader spawns the
+	// caller that drives teardown, exactly as `gc session close` runs as a
+	// descendant of the agent it is tearing down. The caller ignores SIGHUP so
+	// that its survival is evidence of the exclusion rather than of tmux's own
+	// teardown losing a race with the assertion below.
+	dir := t.TempDir()
+	callerPIDPath := filepath.Join(dir, "caller.pid")
+	script := filepath.Join(dir, "pane.sh")
+	body := "#!/bin/sh\ntrap '' HUP\nsleep 600 &\necho $! > " + callerPIDPath + "\nwait\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write pane script: %v", err)
+	}
+
+	const session = "selfclose-target"
+	if err := provider.Start(context.Background(), session, runtimepkg.Config{Command: "/bin/sh " + script}); err != nil {
+		t.Fatalf("start %s: %v", session, err)
+	}
+
+	panePID := mustPID(t, mustPanePID(t, tmux, session))
+	callerPID := mustPID(t, waitForFileContents(t, callerPIDPath, 10*time.Second))
+	t.Cleanup(func() { _ = syscall.Kill(callerPID, syscall.SIGKILL) })
+
+	// The exclusion must be recognized as owned by this pane. A foreign
+	// classification here is the misordering risk itself, so assert it before
+	// the teardown rather than inferring it from the outcome.
+	plan := waitForProcessKillPlan(t, panePID, 10*time.Second, func(plan processKillPlan) bool {
+		return plan.Leader != nil && len(plan.Descendants) > 0
+	})
+	excluded := buildProcessKillPlan(panePID, mustProcessSnapshot(t), map[int]bool{callerPID: true})
+	if !excluded.PreserveExclusion {
+		t.Fatalf("in-pane caller %d was not captured as an owned exclusion: %+v", callerPID, excluded)
+	}
+	if slices.ContainsFunc(excluded.Descendants, func(target processTarget) bool { return target.PID == callerPID }) {
+		t.Fatalf("excluded caller %d entered the kill plan %+v", callerPID, excluded.Descendants)
+	}
+
+	// Drive the real ordering decision with the plan captured from this live
+	// pane rather than a synthetic one. A misclassified in-pane caller would
+	// reach here as a foreign exclusion and let kill-session run first, which is
+	// the case a synthetic plan can never reproduce.
+	var order []string
+	if err := teardownSessionProcessPlan(
+		excluded,
+		nil,
+		func() error { order = append(order, "kill-session"); return nil },
+		func(processKillPlan) error { order = append(order, "terminate"); return nil },
+	); err != nil {
+		t.Fatalf("teardown ordering for live plan: %v", err)
+	}
+	if want := []string{"terminate", "kill-session"}; !slices.Equal(order, want) {
+		t.Fatalf("live self-close order = %v, want in-pane cleanup before session teardown %v", order, want)
+	}
+
+	snapshot := mustProcessSnapshot(t)
+	callerTarget := mustSnapshotTarget(t, snapshot, callerPID)
+	leaderTarget := mustSnapshotTarget(t, snapshot, panePID)
+	t.Logf("before self-close: socket=%s pane=%d caller=%d descendants=%v", socket, panePID, callerPID, plan.Descendants)
+
+	if err := tmux.KillSessionWithProcessesExcluding(session, []string{strconv.Itoa(callerPID)}); err != nil {
+		t.Fatalf("self-close teardown: %v", err)
+	}
+
+	// The excluded caller must never be signaled by the direct sweep. It ignores
+	// SIGHUP, so the pane teardown that legitimately reaps it last cannot mask a
+	// SIGTERM that the exclusion should have prevented.
+	if !processTargetIsCurrent(callerTarget) {
+		t.Fatalf("excluded in-pane caller %+v did not survive its own cleanup", callerTarget)
+	}
+	waitForProcessTargetsGone(t, []processTarget{leaderTarget}, 10*time.Second)
+	if provider.IsRunning(session) {
+		t.Fatalf("session %q still running after self-close teardown", session)
+	}
+}
+
+// waitForFileContents returns the trimmed contents of path once it is non-empty,
+// failing the test if that does not happen within timeout.
+func waitForFileContents(t *testing.T, path string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(data)) != "" {
+			return strings.TrimSpace(string(data))
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not become non-empty within %s (last error: %v)", path, timeout, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 func TestConfigureServerReappliesExitEmptyAfterReplacement(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
