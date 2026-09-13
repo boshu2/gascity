@@ -3402,16 +3402,22 @@ func TestSelfCloseExcludedInPaneCallerSurvivesCleanup(t *testing.T) {
 // failing the test if that does not happen within timeout.
 func waitForFileContents(t *testing.T, path string, timeout time.Duration) string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
 	for {
 		data, err := os.ReadFile(path)
+		lastErr = err
 		if err == nil && strings.TrimSpace(string(data)) != "" {
 			return strings.TrimSpace(string(data))
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s did not become non-empty within %s (last error: %v)", path, timeout, err)
+		select {
+		case <-timer.C:
+			t.Fatalf("%s did not become non-empty within %s (last error: %v)", path, timeout, lastErr)
+		case <-ticker.C:
 		}
-		time.Sleep(25 * time.Millisecond)
 	}
 }
 
